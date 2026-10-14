@@ -1,21 +1,42 @@
-import time
+import os
 import subprocess
+import time
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Response
-from fastapi.responses import HTMLResponse, StreamingResponse
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from pydantic import BaseModel
+
 from backend.camera import VideoCamera
+from backend.database import (
+    EVENTS_DIR,
+    get_recent_sightings,
+    get_storage_stats,
+    init_db,
+    tag_sighting_entity,
+)
 from backend.version import __version__
 
 camera: VideoCamera = None
 
 
+class TagRequest(BaseModel):
+    name: str
+    category: Optional[str] = "other"
+
+
+class ContinuousSettingRequest(BaseModel):
+    enabled: bool
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global camera
-    print(f"[INFO] Initializing Arducam Video Capture & LiteRT Engine (v{__version__})...")
+    print(f"[INFO] Initializing Edge Nocturne v{__version__}...")
+    init_db()
     camera = VideoCamera(device_id=0, width=1920, height=1080, fps=30, enable_ml=True)
     yield
-    print("[INFO] Releasing camera resources...")
+    print("[INFO] Shutting down camera & recorder...")
     if camera:
         camera.stop()
 
@@ -33,7 +54,7 @@ def generate_mjpeg_stream():
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
                 )
-        time.sleep(0.033)  # ~30 FPS throttle
+        time.sleep(0.033)
 
 
 @app.get("/api/stream")
@@ -58,7 +79,7 @@ def get_snapshot():
 
 @app.get("/api/stats")
 def get_system_stats():
-    """Returns system temperature, camera status, and live ML detections."""
+    """Returns system temperature, camera status, ML detections, and storage telemetry."""
     temp_str = "N/A"
     try:
         res = subprocess.run(["vcgencmd", "measure_temp"], capture_output=True, text=True)
@@ -69,8 +90,13 @@ def get_system_stats():
 
     detections = []
     inference_ms = 0.0
+    is_dvr_active = False
+    is_recording_event = False
+
     if camera:
         detections, inference_ms = camera.get_latest_detections()
+        is_dvr_active = camera.is_continuous_recording()
+        is_recording_event = camera.recorder.is_recording_event
 
     return {
         "status": "online",
@@ -80,12 +106,55 @@ def get_system_stats():
         "fps": camera.fps if camera else 0,
         "inference_ms": inference_ms,
         "detections": detections,
+        "storage": get_storage_stats(),
+        "continuous_recording": is_dvr_active,
+        "is_recording_event": is_recording_event,
     }
+
+
+@app.get("/api/events")
+def list_events(limit: int = 50, category: Optional[str] = None):
+    """Returns chronologically ordered sightings with thumbnails and clip links."""
+    return get_recent_sightings(limit=limit, category=category)
+
+
+@app.post("/api/events/{sighting_id}/tag")
+def tag_event(sighting_id: int, req: TagRequest):
+    """Tags a sighting with an identity name (e.g. 'My VW Touran' or 'Fox #1')."""
+    entity_id = tag_sighting_entity(sighting_id, req.name.strip(), req.category)
+    return {"status": "ok", "entity_id": entity_id, "name": req.name.strip()}
+
+
+@app.post("/api/settings/continuous")
+def toggle_continuous_loop(req: ContinuousSettingRequest):
+    """Enables or disables continuous DVR 5-minute loop recording."""
+    if not camera:
+        raise HTTPException(status_code=503, detail="Camera not initialized")
+    camera.set_continuous_recording(req.enabled)
+    return {"status": "ok", "continuous_recording": req.enabled}
+
+
+@app.get("/api/media/clips/{filename}")
+def stream_clip(filename: str):
+    """Serves recorded MP4 event video clips."""
+    filepath = os.path.join(EVENTS_DIR, os.path.basename(filename))
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="Clip not found")
+    return FileResponse(filepath, media_type="video/mp4")
+
+
+@app.get("/api/media/snapshots/{filename}")
+def get_sighting_snapshot(filename: str):
+    """Serves 1080p high-resolution event snapshot images."""
+    filepath = os.path.join(EVENTS_DIR, os.path.basename(filename))
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    return FileResponse(filepath, media_type="image/jpeg")
 
 
 @app.get("/", response_class=HTMLResponse)
 def index_page():
-    """Dark-mode responsive web dashboard with live detection telemetry."""
+    """Dark-mode dashboard with Live Monitor, Sightings Gallery, and Video Modal."""
     return HTML_TEMPLATE.replace("{{VERSION}}", __version__)
 
 
@@ -95,11 +164,12 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Edge Nocturne - Live Monitor & ML</title>
+    <title>Edge Nocturne - Edge Vision & Security</title>
     <style>
         :root {
             --bg-primary: #0a0e17;
             --bg-secondary: #131b2e;
+            --bg-card: #18223a;
             --border-color: #212d4a;
             --accent-cyan: #00f2fe;
             --accent-blue: #4facfe;
@@ -107,6 +177,7 @@ HTML_TEMPLATE = """
             --text-muted: #7e8ba8;
             --status-green: #00e676;
             --alert-orange: #ff9100;
+            --alert-red: #ff5252;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -120,7 +191,7 @@ HTML_TEMPLATE = """
         header {
             background-color: var(--bg-secondary);
             border-bottom: 1px solid var(--border-color);
-            padding: 0.9rem 1.5rem;
+            padding: 0.8rem 1.5rem;
             display: flex;
             justify-content: space-between;
             align-items: center;
@@ -183,17 +254,48 @@ HTML_TEMPLATE = """
             0%, 100% { transform: scale(1); }
             50% { transform: scale(1.02); }
         }
+        .nav-tabs {
+            display: flex;
+            gap: 0.5rem;
+            background: var(--bg-secondary);
+            padding: 0.5rem 1.5rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .tab-btn {
+            background: transparent;
+            border: 1px solid transparent;
+            color: var(--text-muted);
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .tab-btn.active {
+            color: var(--text-primary);
+            background: rgba(0, 242, 254, 0.1);
+            border-color: var(--accent-cyan);
+        }
         main {
             flex: 1;
             padding: 1.5rem;
             display: flex;
             flex-direction: column;
             align-items: center;
-            justify-content: center;
+        }
+        .tab-content {
+            width: 100%;
+            max-width: 1100px;
+            display: none;
+        }
+        .tab-content.active {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
         }
         .video-container {
             width: 100%;
-            max-width: 1100px;
             background: #000;
             border-radius: 12px;
             overflow: hidden;
@@ -234,13 +336,46 @@ HTML_TEMPLATE = """
             display: flex;
             justify-content: space-between;
             align-items: center;
-            transition: all 0.3s ease;
         }
-        .controls {
+        .controls-row {
+            width: 100%;
             margin-top: 1.25rem;
             display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
             gap: 1rem;
         }
+        .dvr-toggle-box {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            background: var(--bg-card);
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+        }
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 44px;
+            height: 24px;
+        }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider {
+            position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+            background-color: #2a3756;
+            transition: .3s;
+            border-radius: 24px;
+        }
+        .slider:before {
+            position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px;
+            background-color: white;
+            transition: .3s;
+            border-radius: 50%;
+        }
+        input:checked + .slider { background-color: var(--status-green); }
+        input:checked + .slider:before { transform: translateX(20px); }
         .btn {
             background: linear-gradient(135deg, #1e2942, #141b2d);
             color: var(--text-primary);
@@ -252,10 +387,145 @@ HTML_TEMPLATE = """
             cursor: pointer;
             transition: all 0.2s ease;
             text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
         }
         .btn:hover {
             border-color: var(--accent-cyan);
             box-shadow: 0 0 15px rgba(0, 242, 254, 0.2);
+        }
+        /* Sightings Gallery Cards */
+        .sightings-grid {
+            width: 100%;
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 1.25rem;
+            margin-top: 1rem;
+        }
+        .sighting-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            transition: transform 0.2s ease, border-color 0.2s ease;
+        }
+        .sighting-card:hover {
+            transform: translateY(-2px);
+            border-color: var(--accent-cyan);
+        }
+        .sighting-thumb {
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            object-fit: cover;
+            background: #000;
+        }
+        .sighting-body {
+            padding: 1rem;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+        .sighting-title {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .sighting-label {
+            font-size: 1.05rem;
+            font-weight: 700;
+            color: var(--text-primary);
+            text-transform: capitalize;
+        }
+        .sighting-conf {
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--status-green);
+        }
+        .sighting-time {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+        .entity-pill {
+            display: inline-block;
+            background: rgba(0, 242, 254, 0.1);
+            color: var(--accent-cyan);
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            border: 1px solid rgba(0, 242, 254, 0.2);
+            width: fit-content;
+        }
+        .sighting-actions {
+            margin-top: auto;
+            padding-top: 0.75rem;
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+        .btn-sm {
+            padding: 0.4rem 0.8rem;
+            font-size: 0.8rem;
+        }
+        .tag-input-row {
+            display: flex;
+            gap: 0.4rem;
+            margin-top: 0.5rem;
+        }
+        .tag-input {
+            flex: 1;
+            background: #0d1424;
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 0.35rem 0.6rem;
+            border-radius: 6px;
+            font-size: 0.8rem;
+        }
+        /* Modal Video Player */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            top: 0; left: 0; width: 100vw; height: 100vh;
+            background: rgba(0, 0, 0, 0.85);
+            backdrop-filter: blur(8px);
+            align-items: center;
+            justify-content: center;
+        }
+        .modal.open { display: flex; }
+        .modal-content {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            max-width: 900px;
+            width: 92%;
+            overflow: hidden;
+            box-shadow: 0 25px 50px rgba(0, 0, 0, 0.8);
+        }
+        .modal-header {
+            padding: 0.8rem 1.25rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .modal-close {
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            font-size: 1.4rem;
+            cursor: pointer;
+        }
+        .modal-close:hover { color: var(--text-primary); }
+        .modal-video {
+            width: 100%;
+            max-height: 70vh;
+            display: block;
+            background: #000;
         }
     </style>
 </head>
@@ -267,51 +537,109 @@ HTML_TEMPLATE = """
         </div>
         <div class="meta-badges">
             <div class="badge badge-detection" id="detection-badge">🟢 Scene Clear</div>
+            <div class="badge" id="storage-badge">💾 Disk: --% Free</div>
             <div class="badge" id="latency-badge">⚡ LiteRT: -- ms</div>
             <div class="badge" id="temp-badge">CPU: --°C</div>
-            <div class="badge">1080P IR Stream</div>
             <div class="badge" id="version-badge" style="font-family: monospace; color: var(--accent-cyan); font-weight: 600;">v{{VERSION}}</div>
         </div>
     </header>
+    
+    <div class="nav-tabs">
+        <button class="tab-btn active" onclick="switchTab('live')">📹 Live Monitor</button>
+        <button class="tab-btn" onclick="switchTab('sightings')">📁 Sightings Timeline (<span id="sightings-count">0</span>)</button>
+    </div>
+
     <main>
-        <div class="video-container">
-            <div class="hud-overlay" id="hud-res">FEED: 1920x1080 @ 30 FPS</div>
-            <img class="video-feed" src="/api/stream" alt="Edge Nocturne Live Feed" />
-            <div class="hud-detection-banner" id="detection-banner">
-                <span id="banner-text">AI Scanner: Watching scene...</span>
-                <span style="color: var(--text-muted); font-size: 0.8rem;" id="banner-meta">Clean Stream (Unadorned)</span>
+        <!-- Tab 1: Live Monitor -->
+        <div class="tab-content active" id="tab-live">
+            <div class="video-container">
+                <div class="hud-overlay" id="hud-res">FEED: 1920x1080 @ 30 FPS</div>
+                <img class="video-feed" src="/api/stream" alt="Edge Nocturne Live Feed" />
+                <div class="hud-detection-banner" id="detection-banner">
+                    <span id="banner-text">AI Scanner: Watching scene...</span>
+                    <span style="color: var(--text-muted); font-size: 0.8rem;">Clean 1080p Stream</span>
+                </div>
+            </div>
+            <div class="controls-row">
+                <div class="dvr-toggle-box">
+                    <label class="switch">
+                        <input type="checkbox" id="dvr-toggle" onchange="toggleContinuousDVR(this.checked)">
+                        <span class="slider"></span>
+                    </label>
+                    <div>
+                        <div style="font-size: 0.9rem; font-weight: 600;">Continuous DVR Loop</div>
+                        <div style="font-size: 0.75rem; color: var(--text-muted);">Keep last 24h • 15% Min Free Guard</div>
+                    </div>
+                </div>
+                <div style="display: flex; gap: 0.75rem;">
+                    <a class="btn" href="/api/snapshot" target="_blank">📸 Take Clean Snapshot</a>
+                    <button class="btn" onclick="toggleFullscreen()">⛶ Fullscreen</button>
+                </div>
             </div>
         </div>
-        <div class="controls">
-            <a class="btn" href="/api/snapshot" target="_blank">📸 Take Clean Snapshot</a>
-            <button class="btn" onclick="toggleFullscreen()">⛶ Fullscreen</button>
+
+        <!-- Tab 2: Sightings Timeline -->
+        <div class="tab-content" id="tab-sightings">
+            <div style="width: 100%; display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                <h2 style="font-size: 1.15rem;">Detection Timeline</h2>
+                <button class="btn btn-sm" onclick="loadSightings()">🔄 Refresh Feed</button>
+            </div>
+            <div class="sightings-grid" id="sightings-container">
+                <p style="color: var(--text-muted); padding: 2rem;">Loading detection events...</p>
+            </div>
         </div>
     </main>
+
+    <!-- Modal Video Player -->
+    <div class="modal" id="video-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span style="font-weight: 600;" id="modal-title">Playback Sighting Clip</span>
+                <button class="modal-close" onclick="closeModal()">✕</button>
+            </div>
+            <video class="modal-video" id="player" controls></video>
+        </div>
+    </div>
+
     <script>
+        function switchTab(tab) {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            if (tab === 'live') {
+                document.querySelectorAll('.tab-btn')[0].classList.add('active');
+                document.getElementById('tab-live').classList.add('active');
+            } else {
+                document.querySelectorAll('.tab-btn')[1].classList.add('active');
+                document.getElementById('tab-sightings').classList.add('active');
+                loadSightings();
+            }
+        }
+
         async function updateStats() {
             try {
                 const res = await fetch('/api/stats');
                 const data = await res.json();
                 
-                // Version & Resolution
                 if (data.version) {
                     document.getElementById('version-badge').innerText = 'v' + data.version;
                 }
                 if (data.resolution && document.getElementById('hud-res')) {
                     document.getElementById('hud-res').innerText = 'FEED: ' + data.resolution + ' @ ' + (data.fps || 30) + ' FPS';
                 }
-
-                // CPU Temperature
                 if (data.cpu_temp) {
                     document.getElementById('temp-badge').innerText = 'CPU: ' + data.cpu_temp;
                 }
-                
-                // ML Latency
                 if (data.inference_ms !== undefined) {
                     document.getElementById('latency-badge').innerText = '⚡ LiteRT: ' + data.inference_ms + ' ms';
                 }
+                if (data.storage && data.storage.free_percent !== undefined) {
+                    document.getElementById('storage-badge').innerText = '💾 Disk: ' + data.storage.free_percent + '% Free';
+                }
+                if (data.continuous_recording !== undefined) {
+                    document.getElementById('dvr-toggle').checked = data.continuous_recording;
+                }
 
-                // Detections
+                // Live Detections
                 const detBadge = document.getElementById('detection-badge');
                 const bannerText = document.getElementById('banner-text');
 
@@ -329,6 +657,90 @@ HTML_TEMPLATE = """
         }
         setInterval(updateStats, 1000);
         updateStats();
+
+        async function toggleContinuousDVR(enabled) {
+            try {
+                await fetch('/api/settings/continuous', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ enabled })
+                });
+            } catch(e) {
+                alert('Failed to update DVR setting');
+            }
+        }
+
+        async function loadSightings() {
+            try {
+                const res = await fetch('/api/events?limit=30');
+                const sightings = await res.json();
+                document.getElementById('sightings-count').innerText = sightings.length;
+                const container = document.getElementById('sightings-container');
+                
+                if (sightings.length === 0) {
+                    container.innerHTML = '<p style="color: var(--text-muted); padding: 2rem;">No events recorded yet. Walk in front of the camera to trigger your first sighting!</p>';
+                    return;
+                }
+
+                container.innerHTML = sightings.map(s => `
+                    <div class="sighting-card">
+                        <img class="sighting-thumb" src="/api/media/snapshots/${s.snapshot_filename}" alt="${s.label}" loading="lazy">
+                        <div class="sighting-body">
+                            <div class="sighting-title">
+                                <span class="sighting-label">${s.label}</span>
+                                <span class="sighting-conf">${Math.round(s.confidence * 100)}%</span>
+                            </div>
+                            <div class="sighting-time">📅 ${s.timestamp}</div>
+                            ${s.entity_name ? `<div class="entity-pill">🏷️ ${s.entity_name}</div>` : ''}
+                            
+                            <div class="sighting-actions">
+                                ${s.clip_filename ? `<button class="btn btn-sm" onclick="playClip('${s.clip_filename}', '${s.label} - ${s.timestamp}')">▶ Play 10s Clip</button>` : ''}
+                                <a class="btn btn-sm" href="/api/media/snapshots/${s.snapshot_filename}" target="_blank">📸 1080p Frame</a>
+                            </div>
+
+                            <div class="tag-input-row">
+                                <input type="text" class="tag-input" id="tag-${s.id}" placeholder="Tag identity (e.g. My Car)">
+                                <button class="btn btn-sm" onclick="saveTag(${s.id})">Tag</button>
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
+            } catch(e) {}
+        }
+
+        async function saveTag(id) {
+            const input = document.getElementById('tag-' + id);
+            const name = input.value.trim();
+            if (!name) return;
+
+            try {
+                await fetch('/api/events/' + id + '/tag', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ name })
+                });
+                loadSightings();
+            } catch(e) {
+                alert('Failed to save tag');
+            }
+        }
+
+        function playClip(filename, title) {
+            const modal = document.getElementById('video-modal');
+            const player = document.getElementById('player');
+            document.getElementById('modal-title').innerText = title;
+            player.src = '/api/media/clips/' + filename;
+            modal.classList.add('open');
+            player.play();
+        }
+
+        function closeModal() {
+            const modal = document.getElementById('video-modal');
+            const player = document.getElementById('player');
+            player.pause();
+            player.src = '';
+            modal.classList.remove('open');
+        }
 
         function toggleFullscreen() {
             const el = document.querySelector('.video-container');

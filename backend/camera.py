@@ -3,10 +3,11 @@ import threading
 import time
 from typing import List, Optional, Tuple
 from backend.detector import ObjectDetector
+from backend.recorder import VideoRecorder
 
 
 class VideoCamera:
-    """Threaded camera capture + asynchronous background LiteRT ML inference."""
+    """Threaded camera capture + asynchronous background LiteRT ML + dual-mode recording."""
 
     def __init__(
         self,
@@ -40,6 +41,9 @@ class VideoCamera:
         if not self.grabbed:
             print(f"[WARN] Failed to read initial frame from camera device {self.device_id}")
 
+        # Initialize Dual-mode Video Recorder (Event pre-roll + continuous DVR loop)
+        self.recorder = VideoRecorder(width=self.width, height=self.height, fps=self.fps)
+
         # Thread 1: High-speed ingestion loop (30 FPS, zero lag)
         self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.capture_thread.start()
@@ -62,6 +66,8 @@ class VideoCamera:
                 with self.frame_lock:
                     self.grabbed = grabbed
                     self.frame = frame
+                # Feed frame into recorder pre-roll ring buffer and continuous DVR chunk
+                self.recorder.add_frame(frame)
             else:
                 time.sleep(0.01)
 
@@ -79,6 +85,15 @@ class VideoCamera:
                     with self.ml_lock:
                         self.latest_detections = detections
                         self.inference_ms = latency
+
+                    # Trigger event recording if person, vehicle, or animal is detected
+                    target_detections = [
+                        d for d in detections
+                        if d.get("category") in ("person", "vehicle", "animal")
+                    ]
+                    if target_detections:
+                        self.recorder.trigger_event(target_detections)
+
                 except Exception as e:
                     print(f"[ERROR] Inference error: {e}")
 
@@ -109,8 +124,15 @@ class VideoCamera:
             return None
         return buffer.tobytes()
 
+    def set_continuous_recording(self, enabled: bool):
+        self.recorder.set_continuous_recording(enabled)
+
+    def is_continuous_recording(self) -> bool:
+        return self.recorder.continuous_enabled
+
     def stop(self):
         self.stopped = True
+        self.recorder.stop()
         if self.capture_thread.is_alive():
             self.capture_thread.join(timeout=1.0)
         if hasattr(self, "ml_thread") and self.ml_thread.is_alive():
