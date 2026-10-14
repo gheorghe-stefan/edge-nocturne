@@ -8,6 +8,8 @@ AGENTS.md
 storage/
 *.db
 *.sqlite3
+models/*.tflite
+models/*.zip
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

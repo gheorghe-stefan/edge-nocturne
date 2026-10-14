@@ -11,8 +11,8 @@ camera: VideoCamera = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global camera
-    print("[INFO] Initializing Arducam Video Capture...")
-    camera = VideoCamera(device_id=0, width=1280, height=720, fps=30)
+    print("[INFO] Initializing Arducam Video Capture & LiteRT Engine...")
+    camera = VideoCamera(device_id=0, width=1280, height=720, fps=30, enable_ml=True)
     yield
     print("[INFO] Releasing camera resources...")
     if camera:
@@ -37,7 +37,7 @@ def generate_mjpeg_stream():
 
 @app.get("/api/stream")
 def video_stream():
-    """MJPEG low-latency streaming endpoint."""
+    """MJPEG low-latency streaming endpoint (Clean video stream)."""
     return StreamingResponse(
         generate_mjpeg_stream(),
         media_type="multipart/x-mixed-replace; boundary=frame",
@@ -46,7 +46,7 @@ def video_stream():
 
 @app.get("/api/snapshot")
 def get_snapshot():
-    """Returns a single high-quality JPEG snapshot."""
+    """Returns a single clean high-quality JPEG snapshot."""
     if not camera:
         return Response(status_code=503, content="Camera not initialized")
     frame_bytes = camera.get_jpeg_bytes(quality=95)
@@ -57,7 +57,7 @@ def get_snapshot():
 
 @app.get("/api/stats")
 def get_system_stats():
-    """Returns system temperature and camera status."""
+    """Returns system temperature, camera status, and live ML detections."""
     temp_str = "N/A"
     try:
         res = subprocess.run(["vcgencmd", "measure_temp"], capture_output=True, text=True)
@@ -66,24 +66,31 @@ def get_system_stats():
     except Exception:
         pass
 
+    detections = []
+    inference_ms = 0.0
+    if camera:
+        detections, inference_ms = camera.get_latest_detections()
+
     return {
         "status": "online",
         "cpu_temp": temp_str,
         "resolution": f"{camera.width}x{camera.height}" if camera else "offline",
         "fps": camera.fps if camera else 0,
+        "inference_ms": inference_ms,
+        "detections": detections,
     }
 
 
 @app.get("/", response_class=HTMLResponse)
 def index_page():
-    """Dark-mode responsive web dashboard."""
+    """Dark-mode responsive web dashboard with live detection telemetry."""
     return """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Edge Nocturne - Live Monitor</title>
+    <title>Edge Nocturne - Live Monitor & ML</title>
     <style>
         :root {
             --bg-primary: #0a0e17;
@@ -94,6 +101,7 @@ def index_page():
             --text-primary: #f0f4fc;
             --text-muted: #7e8ba8;
             --status-green: #00e676;
+            --alert-orange: #ff9100;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -107,10 +115,12 @@ def index_page():
         header {
             background-color: var(--bg-secondary);
             border-bottom: 1px solid var(--border-color);
-            padding: 1rem 1.5rem;
+            padding: 0.9rem 1.5rem;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            flex-wrap: wrap;
+            gap: 0.75rem;
         }
         .brand {
             display: flex;
@@ -139,15 +149,34 @@ def index_page():
         }
         .meta-badges {
             display: flex;
-            gap: 0.75rem;
-            font-size: 0.85rem;
-            color: var(--text-muted);
+            gap: 0.6rem;
+            align-items: center;
+            flex-wrap: wrap;
         }
         .badge {
             background: rgba(255, 255, 255, 0.05);
             padding: 0.25rem 0.6rem;
             border-radius: 6px;
             border: 1px solid var(--border-color);
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            transition: all 0.3s ease;
+        }
+        .badge-detection {
+            font-weight: 600;
+            border-color: rgba(0, 230, 118, 0.3);
+            color: var(--status-green);
+        }
+        .badge-detection.detected {
+            border-color: rgba(255, 145, 0, 0.6);
+            color: var(--alert-orange);
+            background: rgba(255, 145, 0, 0.12);
+            box-shadow: 0 0 12px rgba(255, 145, 0, 0.25);
+            animation: pulse-alert 1.5s infinite;
+        }
+        @keyframes pulse-alert {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.02); }
         }
         main {
             flex: 1;
@@ -186,8 +215,24 @@ def index_page():
             font-family: monospace;
             border: 1px solid rgba(255, 255, 255, 0.1);
         }
+        .hud-detection-banner {
+            position: absolute;
+            bottom: 1rem;
+            left: 1rem;
+            right: 1rem;
+            background: rgba(10, 14, 23, 0.85);
+            backdrop-filter: blur(10px);
+            padding: 0.6rem 1rem;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            border: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: all 0.3s ease;
+        }
         .controls {
-            margin-top: 1rem;
+            margin-top: 1.25rem;
             display: flex;
             gap: 1rem;
         }
@@ -216,18 +261,23 @@ def index_page():
             <div class="brand-title">EDGE NOCTURNE</div>
         </div>
         <div class="meta-badges">
+            <div class="badge badge-detection" id="detection-badge">🟢 Scene Clear</div>
+            <div class="badge" id="latency-badge">⚡ LiteRT: -- ms</div>
             <div class="badge" id="temp-badge">CPU: --°C</div>
-            <div class="badge">Arducam 1080P IR</div>
-            <div class="badge">Live MJPEG</div>
+            <div class="badge">1080P IR Stream</div>
         </div>
     </header>
     <main>
         <div class="video-container">
-            <div class="hud-overlay" id="hud">FEED: 1280x720 @ 30 FPS</div>
+            <div class="hud-overlay">FEED: 1280x720 @ 30 FPS</div>
             <img class="video-feed" src="/api/stream" alt="Edge Nocturne Live Feed" />
+            <div class="hud-detection-banner" id="detection-banner">
+                <span id="banner-text">AI Scanner: Watching scene...</span>
+                <span style="color: var(--text-muted); font-size: 0.8rem;" id="banner-meta">Clean Stream (Unadorned)</span>
+            </div>
         </div>
         <div class="controls">
-            <a class="btn" href="/api/snapshot" target="_blank">📸 Take Snapshot</a>
+            <a class="btn" href="/api/snapshot" target="_blank">📸 Take Clean Snapshot</a>
             <button class="btn" onclick="toggleFullscreen()">⛶ Fullscreen</button>
         </div>
     </main>
@@ -236,12 +286,34 @@ def index_page():
             try {
                 const res = await fetch('/api/stats');
                 const data = await res.json();
+                
+                // CPU Temperature
                 if (data.cpu_temp) {
                     document.getElementById('temp-badge').innerText = 'CPU: ' + data.cpu_temp;
                 }
+                
+                // ML Latency
+                if (data.inference_ms !== undefined) {
+                    document.getElementById('latency-badge').innerText = '⚡ LiteRT: ' + data.inference_ms + ' ms';
+                }
+
+                // Detections
+                const detBadge = document.getElementById('detection-badge');
+                const bannerText = document.getElementById('banner-text');
+
+                if (data.detections && data.detections.length > 0) {
+                    const topItems = data.detections.map(d => `${d.label} (${Math.round(d.confidence * 100)}%)`).join(', ');
+                    detBadge.innerText = '🎯 Detected: ' + topItems;
+                    detBadge.classList.add('detected');
+                    bannerText.innerHTML = '🎯 <strong style="color: var(--alert-orange);">' + topItems + '</strong> in frame';
+                } else {
+                    detBadge.innerText = '🟢 Scene Clear';
+                    detBadge.classList.remove('detected');
+                    bannerText.innerText = 'AI Scanner: Scene Clear';
+                }
             } catch(e) {}
         }
-        setInterval(updateStats, 3000);
+        setInterval(updateStats, 1000);
         updateStats();
 
         function toggleFullscreen() {
