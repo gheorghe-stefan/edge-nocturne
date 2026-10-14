@@ -57,14 +57,19 @@ app = FastAPI(title="Edge Nocturne", version=__version__, lifespan=lifespan)
 def generate_mjpeg_stream(resolution: str = "1080p"):
     """Generator yielding multipart JPEG frames for live browser streaming at requested resolution."""
     while True:
-        if camera:
-            frame_bytes = camera.get_jpeg_bytes(quality=80, resolution=resolution)
-            if frame_bytes:
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
-                )
-        time.sleep(0.033)
+        try:
+            if camera:
+                frame_bytes = camera.get_jpeg_bytes(quality=80, resolution=resolution)
+                if frame_bytes:
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
+                    )
+            time.sleep(0.033)
+        except (GeneratorExit, StopIteration):
+            break
+        except Exception:
+            time.sleep(0.05)
 
 
 @app.get("/api/stream")

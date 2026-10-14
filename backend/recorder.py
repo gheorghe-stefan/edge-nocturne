@@ -1,6 +1,7 @@
 import collections
 import glob
 import os
+import queue
 import subprocess
 import threading
 import time
@@ -58,21 +59,28 @@ class VideoRecorder:
 
         self.stopped = False
 
+        # Dedicated DVR queue & worker thread to decouple disk encoding from camera capture
+        self.dvr_queue = queue.Queue(maxsize=120)
+        self.dvr_thread = threading.Thread(target=self._dvr_worker, daemon=True)
+        self.dvr_thread.start()
+
         # Background worker for continuous chunk rotation and disk safety pruning
         self.pruning_thread = threading.Thread(target=self._maintenance_loop, daemon=True)
         self.pruning_thread.start()
 
     def add_frame(self, frame: np.ndarray):
-        """Adds a fresh live frame to the pre-roll circular buffer and active writers."""
+        """Adds a fresh live frame to circular pre-roll buffer and DVR queue without blocking."""
         if self.stopped or frame is None:
             return
 
         with self.buffer_lock:
             self.frame_buffer.append(frame.copy())
 
-        # If continuous recording is enabled, write to chunk
         if self.continuous_enabled:
-            self._write_continuous_frame(frame)
+            try:
+                self.dvr_queue.put_nowait(frame.copy())
+            except queue.Full:
+                pass  # Drop frame instead of stuttering camera capture loop
 
     def trigger_event(self, detections: List[Dict[str, Any]]) -> bool:
         """Triggers an event-clip recording if cooldown has passed and target is detected."""
@@ -191,38 +199,68 @@ class VideoRecorder:
         )
         print(f"[RECORDER] Sighting recorded: {best_det.get('label')} -> {clip_filename}")
 
-    def _write_continuous_frame(self, frame: np.ndarray):
-        """Writes frame to the current 5-minute chunk, rotating when expired."""
-        now = time.time()
-        # Rotate chunk if duration exceeded or writer uninitialized
-        if (
-            self.continuous_writer is None
-            or (now - self.continuous_chunk_start) >= self.chunk_duration_seconds
-        ):
-            if self.continuous_writer:
-                self.continuous_writer.release()
+    def _dvr_worker(self):
+        """Dedicated background worker that writes DVR chunks safely without touching capture loop."""
+        while not self.stopped:
+            if not self.continuous_enabled:
+                if self.continuous_writer is not None:
+                    try:
+                        self.continuous_writer.release()
+                    except Exception as e:
+                        print(f"[WARN] Error releasing DVR writer: {e}")
+                    self.continuous_writer = None
+                    print("[DVR] Continuous chunk finalized.")
 
-            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            chunk_filename = f"dvr_{timestamp_str}.mp4"
-            chunk_path = os.path.join(CONTINUOUS_DIR, chunk_filename)
+                # Drain queue while disabled
+                while not self.dvr_queue.empty():
+                    try:
+                        self.dvr_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                time.sleep(0.1)
+                continue
 
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            self.continuous_writer = cv2.VideoWriter(
-                chunk_path, fourcc, self.fps, (self.width, self.height)
-            )
-            self.continuous_chunk_start = now
-            print(f"[DVR] Started new 5-min continuous chunk: {chunk_filename}")
+            try:
+                frame = self.dvr_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
 
-        if self.continuous_writer:
-            self.continuous_writer.write(frame)
+            if frame is None:
+                continue
+
+            now = time.time()
+            if (
+                self.continuous_writer is None
+                or (now - self.continuous_chunk_start) >= self.chunk_duration_seconds
+            ):
+                if self.continuous_writer is not None:
+                    try:
+                        self.continuous_writer.release()
+                    except Exception as e:
+                        print(f"[WARN] Error rotating DVR chunk: {e}")
+
+                timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                chunk_filename = f"dvr_{timestamp_str}.mp4"
+                chunk_path = os.path.join(CONTINUOUS_DIR, chunk_filename)
+
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                self.continuous_writer = cv2.VideoWriter(
+                    chunk_path, fourcc, self.fps, (self.width, self.height)
+                )
+                self.continuous_chunk_start = now
+                print(f"[DVR] Started new 5-min continuous chunk: {chunk_filename}")
+
+            if self.continuous_writer is not None:
+                try:
+                    self.continuous_writer.write(frame)
+                except Exception as e:
+                    print(f"[WARN] Error writing continuous DVR frame: {e}")
 
     def set_continuous_recording(self, enabled: bool):
-        """Toggles continuous DVR loop on or off."""
+        """Toggles continuous DVR loop on or off safely."""
         self.continuous_enabled = enabled
-        if not enabled and self.continuous_writer:
-            self.continuous_writer.release()
-            self.continuous_writer = None
-            print("[DVR] Continuous loop stopped.")
+        if not enabled:
+            print("[DVR] Continuous loop stopped by user.")
 
     def _maintenance_loop(self):
         """Runs every 60 seconds to prune old continuous chunks and enforce the 15% disk safety guard."""

@@ -61,15 +61,18 @@ class VideoCamera:
     def _capture_loop(self):
         """Dedicated thread to constantly drain camera buffer at full frame rate."""
         while not self.stopped:
-            grabbed, frame = self.cap.read()
-            if grabbed:
-                with self.frame_lock:
-                    self.grabbed = grabbed
-                    self.frame = frame
-                # Feed frame into recorder pre-roll ring buffer and continuous DVR chunk
-                self.recorder.add_frame(frame)
-            else:
-                time.sleep(0.01)
+            try:
+                grabbed, frame = self.cap.read()
+                if grabbed and frame is not None:
+                    with self.frame_lock:
+                        self.grabbed = grabbed
+                        self.frame = frame
+                    self.recorder.add_frame(frame)
+                else:
+                    time.sleep(0.01)
+            except Exception as e:
+                print(f"[WARN] Camera capture loop warning: {e}")
+                time.sleep(0.02)
 
     def _inference_loop(self):
         """Asynchronous ML worker running inference on the newest frame."""
