@@ -11,8 +11,8 @@ class VideoCamera:
     def __init__(
         self,
         device_id: int = 0,
-        width: int = 1280,
-        height: int = 720,
+        width: int = 1920,
+        height: int = 1080,
         fps: int = 30,
         enable_ml: bool = True,
     ):

@@ -13,7 +13,7 @@ camera: VideoCamera = None
 async def lifespan(app: FastAPI):
     global camera
     print(f"[INFO] Initializing Arducam Video Capture & LiteRT Engine (v{__version__})...")
-    camera = VideoCamera(device_id=0, width=1280, height=720, fps=30, enable_ml=True)
+    camera = VideoCamera(device_id=0, width=1920, height=1080, fps=30, enable_ml=True)
     yield
     print("[INFO] Releasing camera resources...")
     if camera:
@@ -275,7 +275,7 @@ HTML_TEMPLATE = """
     </header>
     <main>
         <div class="video-container">
-            <div class="hud-overlay">FEED: 1280x720 @ 30 FPS</div>
+            <div class="hud-overlay" id="hud-res">FEED: 1920x1080 @ 30 FPS</div>
             <img class="video-feed" src="/api/stream" alt="Edge Nocturne Live Feed" />
             <div class="hud-detection-banner" id="detection-banner">
                 <span id="banner-text">AI Scanner: Watching scene...</span>
@@ -293,9 +293,12 @@ HTML_TEMPLATE = """
                 const res = await fetch('/api/stats');
                 const data = await res.json();
                 
-                // Version
+                // Version & Resolution
                 if (data.version) {
                     document.getElementById('version-badge').innerText = 'v' + data.version;
+                }
+                if (data.resolution && document.getElementById('hud-res')) {
+                    document.getElementById('hud-res').innerText = 'FEED: ' + data.resolution + ' @ ' + (data.fps || 30) + ' FPS';
                 }
 
                 // CPU Temperature
