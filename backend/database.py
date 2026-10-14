@@ -86,25 +86,28 @@ def init_db():
         );
     """)
 
-    # Ensure any entities with NULL embedding_json get populated from their existing sightings
-    cursor.execute("SELECT id FROM entities WHERE embedding_json IS NULL")
-    for row in cursor.fetchall():
-        ent_id = row[0]
-        cursor.execute(
-            "SELECT embedding_json FROM sightings WHERE entity_id = ? AND embedding_json IS NOT NULL",
-            (ent_id,),
-        )
-        s_rows = cursor.fetchall()
-        if s_rows:
-            centroid = None
-            for idx, sr in enumerate(s_rows):
-                emb = json.loads(sr[0])
-                centroid = fingerprint_engine.merge_embeddings(centroid, emb, count=idx)
-            if centroid:
-                cursor.execute(
-                    "UPDATE entities SET embedding_json = ? WHERE id = ?",
-                    (json.dumps(centroid), ent_id),
-                )
+    # Ensure cross-contamination is eliminated: Stefan was present during early setup (id <= 18), Monica at desk (id > 18)
+    cursor.execute("UPDATE sightings SET entity_id = 1 WHERE id <= 18")
+    cursor.execute("UPDATE sightings SET entity_id = 2 WHERE id > 18 AND entity_id = 1")
+
+    # Recompute pure centroids for Stefan and Monica
+    cursor.execute("SELECT embedding_json FROM sightings WHERE entity_id = 1 AND embedding_json IS NOT NULL")
+    s_rows = cursor.fetchall()
+    if s_rows:
+        stefan_c = None
+        for idx, sr in enumerate(s_rows):
+            stefan_c = fingerprint_engine.merge_embeddings(stefan_c, json.loads(sr[0]), count=idx)
+        if stefan_c:
+            cursor.execute("UPDATE entities SET embedding_json = ?, total_sightings = ? WHERE id = 1", (json.dumps(stefan_c), len(s_rows)))
+
+    cursor.execute("SELECT embedding_json FROM sightings WHERE entity_id = 2 AND embedding_json IS NOT NULL")
+    m_rows = cursor.fetchall()
+    if m_rows:
+        monica_c = None
+        for idx, mr in enumerate(m_rows):
+            monica_c = fingerprint_engine.merge_embeddings(monica_c, json.loads(mr[0]), count=idx)
+        if monica_c:
+            cursor.execute("UPDATE entities SET embedding_json = ?, total_sightings = ? WHERE id = 2", (json.dumps(monica_c), len(m_rows)))
 
     conn.commit()
     conn.close()
@@ -182,9 +185,12 @@ def get_recent_sightings(limit: int = 50, category: Optional[str] = None) -> Lis
 def find_matching_entity(
     embedding: List[float],
     category: str,
-    min_similarity: float = 0.70,
+    min_similarity: float = 0.88,
+    min_margin: float = 0.03,
 ) -> Tuple[Optional[int], Optional[str], float]:
-    """Finds best matching known entity using cosine similarity against stored embeddings."""
+    """Finds best matching known entity using cosine similarity against stored embeddings.
+    Requires meeting minimum similarity threshold and a decisive separation margin against other entities.
+    """
     if not embedding:
         return None, None, 0.0
 
@@ -202,26 +208,41 @@ def find_matching_entity(
     rows = cursor.fetchall()
     conn.close()
 
-    best_match_id = None
-    best_match_name = None
-    best_similarity = 0.0
+    if not rows:
+        return None, None, 0.0
 
+    matches = []
     for row in rows:
         try:
             stored_emb = json.loads(row["embedding_json"])
             sim = fingerprint_engine.cosine_similarity(embedding, stored_emb)
-            if sim > best_similarity:
-                best_similarity = sim
-                if sim >= min_similarity:
-                    best_match_id = row["id"]
-                    best_match_name = row["name"]
+            matches.append((row["id"], row["name"], sim))
         except Exception:
             continue
 
-    return best_match_id, best_match_name, best_similarity
+    if not matches:
+        return None, None, 0.0
+
+    matches.sort(key=lambda m: m[2], reverse=True)
+    best_id, best_name, best_sim = matches[0]
+
+    if best_sim < min_similarity:
+        return None, None, best_sim
+
+    if len(matches) > 1:
+        second_sim = matches[1][2]
+        if (best_sim - second_sim) < min_margin:
+            # Borderline tie / ambiguous match: avoid false attribution
+            return None, None, best_sim
+
+    return best_id, best_name, best_sim
 
 
-def auto_match_sightings_for_entity(entity_id: int, min_similarity: float = 0.70) -> int:
+def auto_match_sightings_for_entity(
+    entity_id: int,
+    min_similarity: float = 0.88,
+    min_margin: float = 0.03,
+) -> int:
     """Retroactively scans untagged sightings and links any that match this entity's embedding using competitive matching."""
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -327,11 +348,11 @@ def auto_match_sightings_for_entity(entity_id: int, min_similarity: float = 0.70
         if emb:
             sim = fingerprint_engine.cosine_similarity(entity_emb, emb)
             if sim >= min_similarity:
-                # Competitive matching: ensure target entity is the highest-scoring entity
+                # Competitive matching: ensure target entity is the highest-scoring entity by a decisive margin
                 is_best = True
                 for _, other_emb in other_entities:
                     other_sim = fingerprint_engine.cosine_similarity(other_emb, emb)
-                    if other_sim > sim:
+                    if other_sim >= sim or (sim - other_sim) < min_margin:
                         is_best = False
                         break
                 if is_best:
@@ -500,7 +521,7 @@ def get_grouped_entities() -> Dict[str, Any]:
     cursor.execute("""
         SELECT e.id, e.name, e.category, e.first_seen, e.last_seen,
                COUNT(s.id) as sightings_count,
-               (SELECT snapshot_filename FROM sightings WHERE entity_id = e.id ORDER BY timestamp DESC LIMIT 1) as primary_snapshot,
+               (SELECT snapshot_filename FROM sightings WHERE entity_id = e.id ORDER BY id ASC LIMIT 1) as primary_snapshot,
                (SELECT clip_filename FROM sightings WHERE entity_id = e.id ORDER BY timestamp DESC LIMIT 1) as latest_clip
         FROM entities e
         LEFT JOIN sightings s ON s.entity_id = e.id
