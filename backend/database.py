@@ -155,6 +155,44 @@ def tag_sighting_entity(sighting_id: int, entity_name: str, category: str = "oth
     return entity_id
 
 
+def get_grouped_entities() -> Dict[str, Any]:
+    """Returns unique identified entities with their sightings count, primary photo, and appearance history."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT e.id, e.name, e.category, e.first_seen, e.last_seen,
+               COUNT(s.id) as sightings_count,
+               (SELECT snapshot_filename FROM sightings WHERE entity_id = e.id ORDER BY timestamp DESC LIMIT 1) as primary_snapshot,
+               (SELECT clip_filename FROM sightings WHERE entity_id = e.id ORDER BY timestamp DESC LIMIT 1) as latest_clip
+        FROM entities e
+        LEFT JOIN sightings s ON s.entity_id = e.id
+        GROUP BY e.id
+        ORDER BY e.last_seen DESC
+    """)
+    entities = [dict(r) for r in cursor.fetchall()]
+
+    for ent in entities:
+        cursor.execute("""
+            SELECT id, timestamp, label, confidence, snapshot_filename, clip_filename
+            FROM sightings
+            WHERE entity_id = ?
+            ORDER BY timestamp DESC
+        """, (ent["id"],))
+        ent["sightings"] = [dict(s) for s in cursor.fetchall()]
+
+    cursor.execute("""
+        SELECT id, timestamp, label, category, confidence, snapshot_filename, clip_filename
+        FROM sightings
+        WHERE entity_id IS NULL
+        ORDER BY timestamp DESC
+    """)
+    untagged = [dict(s) for s in cursor.fetchall()]
+
+    conn.close()
+    return {"entities": entities, "untagged": untagged}
+
+
 def get_storage_stats() -> Dict[str, Any]:
     """Returns disk usage and free space statistics for the storage filesystem."""
     try:

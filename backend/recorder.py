@@ -1,6 +1,7 @@
 import collections
 import glob
 import os
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -116,9 +117,11 @@ class VideoRecorder:
             cv2.imwrite(snap_path, best_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
             cv2.imwrite(archive_snap_path, best_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
 
-        # 3. Initialize VideoWriter (mp4v codec)
+        raw_clip_path = clip_path + ".raw.mp4"
+
+        # 3. Initialize VideoWriter
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(clip_path, fourcc, self.fps, (self.width, self.height))
+        writer = cv2.VideoWriter(raw_clip_path, fourcc, self.fps, (self.width, self.height))
 
         # Write pre-roll frames
         for f in pre_roll_frames:
@@ -126,7 +129,6 @@ class VideoRecorder:
 
         # Record remaining duration (e.g. next 8 seconds)
         remaining_frames = int((self.event_duration - 2.0) * self.fps)
-        start_wait = time.time()
 
         for _ in range(remaining_frames):
             time.sleep(1.0 / self.fps)
@@ -135,6 +137,27 @@ class VideoRecorder:
                     writer.write(self.frame_buffer[-1])
 
         writer.release()
+
+        # Convert to web-standard H.264 (avc1) with +faststart for instant browser playback
+        try:
+            cmd = [
+                "ffmpeg", "-y", "-i", raw_clip_path,
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-crf", "23", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart", clip_path
+            ]
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0 and os.path.exists(clip_path):
+                if os.path.exists(raw_clip_path):
+                    os.remove(raw_clip_path)
+            else:
+                if os.path.exists(raw_clip_path):
+                    os.rename(raw_clip_path, clip_path)
+        except Exception as e:
+            print(f"[WARN] ffmpeg conversion error: {e}")
+            if os.path.exists(raw_clip_path):
+                os.rename(raw_clip_path, clip_path)
+
         self.is_recording_event = False
 
         # 4. Log sighting to SQLite database

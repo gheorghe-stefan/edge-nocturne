@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from backend.camera import VideoCamera
 from backend.database import (
     EVENTS_DIR,
+    get_grouped_entities,
     get_recent_sightings,
     get_storage_stats,
     init_db,
@@ -118,6 +119,12 @@ def list_events(limit: int = 50, category: Optional[str] = None):
     return get_recent_sightings(limit=limit, category=category)
 
 
+@app.get("/api/entities")
+def list_entities():
+    """Returns unique identified entities with their sightings count and history."""
+    return get_grouped_entities()
+
+
 @app.post("/api/events/{sighting_id}/tag")
 def tag_event(sighting_id: int, req: TagRequest):
     """Tags a sighting with an identity name (e.g. 'My VW Touran' or 'Fox #1')."""
@@ -136,11 +143,11 @@ def toggle_continuous_loop(req: ContinuousSettingRequest):
 
 @app.get("/api/media/clips/{filename}")
 def stream_clip(filename: str):
-    """Serves recorded MP4 event video clips."""
+    """Serves recorded MP4 event video clips with range request support."""
     filepath = os.path.join(EVENTS_DIR, os.path.basename(filename))
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail="Clip not found")
-    return FileResponse(filepath, media_type="video/mp4")
+    return FileResponse(filepath, media_type="video/mp4", headers={"Accept-Ranges": "bytes"})
 
 
 @app.get("/api/media/snapshots/{filename}")
@@ -578,11 +585,14 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- Tab 2: Sightings Timeline -->
+        <!-- Tab 2: Sightings Timeline & Unique Entities -->
         <div class="tab-content" id="tab-sightings">
-            <div style="width: 100%; display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
-                <h2 style="font-size: 1.15rem;">Detection Timeline</h2>
-                <button class="btn btn-sm" onclick="loadSightings()">🔄 Refresh Feed</button>
+            <div style="width: 100%; display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; gap: 0.5rem;">
+                <div style="display: flex; gap: 0.5rem; background: var(--bg-card); padding: 0.3rem; border-radius: 8px; border: 1px solid var(--border-color);">
+                    <button class="tab-btn active" id="btn-view-entities" onclick="switchSightingsSubView('entities')">👥 Unique Entities</button>
+                    <button class="tab-btn" id="btn-view-all" onclick="switchSightingsSubView('all')">📅 All Sightings Feed</button>
+                </div>
+                <button class="btn btn-sm" onclick="refreshCurrentSightingsView()">🔄 Refresh</button>
             </div>
             <div class="sightings-grid" id="sightings-container">
                 <p style="color: var(--text-muted); padding: 2rem;">Loading detection events...</p>
@@ -597,21 +607,38 @@ HTML_TEMPLATE = """
                 <span style="font-weight: 600;" id="modal-title">Playback Sighting Clip</span>
                 <button class="modal-close" onclick="closeModal()">✕</button>
             </div>
-            <video class="modal-video" id="player" controls></video>
+            <video class="modal-video" id="player" controls playsinline preload="auto"></video>
         </div>
     </div>
 
     <script>
+        let currentSubView = 'entities';
+
         function switchTab(tab) {
-            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.nav-tabs .tab-btn').forEach(b => b.classList.remove('active'));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
             if (tab === 'live') {
-                document.querySelectorAll('.tab-btn')[0].classList.add('active');
+                document.querySelectorAll('.nav-tabs .tab-btn')[0].classList.add('active');
                 document.getElementById('tab-live').classList.add('active');
             } else {
-                document.querySelectorAll('.tab-btn')[1].classList.add('active');
+                document.querySelectorAll('.nav-tabs .tab-btn')[1].classList.add('active');
                 document.getElementById('tab-sightings').classList.add('active');
-                loadSightings();
+                refreshCurrentSightingsView();
+            }
+        }
+
+        function switchSightingsSubView(view) {
+            currentSubView = view;
+            document.getElementById('btn-view-entities').classList.toggle('active', view === 'entities');
+            document.getElementById('btn-view-all').classList.toggle('active', view === 'all');
+            refreshCurrentSightingsView();
+        }
+
+        function refreshCurrentSightingsView() {
+            if (currentSubView === 'entities') {
+                loadGroupedEntities();
+            } else {
+                loadAllSightings();
             }
         }
 
@@ -670,15 +697,121 @@ HTML_TEMPLATE = """
             }
         }
 
-        async function loadSightings() {
+        // 1. Grouped Unique Entities View
+        async function loadGroupedEntities() {
+            const container = document.getElementById('sightings-container');
+            container.innerHTML = '<p style="color: var(--text-muted); padding: 2rem;">Loading unique subjects...</p>';
             try {
-                const res = await fetch('/api/events?limit=30');
+                const res = await fetch('/api/entities');
+                const data = await res.json();
+                const entities = data.entities || [];
+                const untagged = data.untagged || [];
+                
+                const totalCount = entities.reduce((sum, e) => sum + (e.sightings_count || 0), 0) + untagged.length;
+                document.getElementById('sightings-count').innerText = totalCount;
+
+                if (entities.length === 0 && untagged.length === 0) {
+                    container.innerHTML = '<p style="color: var(--text-muted); padding: 2rem;">No subjects recorded yet. Step in front of the camera!</p>';
+                    return;
+                }
+
+                let html = '';
+
+                // Render Identified Entities
+                entities.forEach(ent => {
+                    const primarySnap = ent.primary_snapshot ? `/api/media/snapshots/${ent.primary_snapshot}` : '';
+                    const sightingsList = ent.sightings || [];
+
+                    html += `
+                        <div class="sighting-card" style="border: 1px solid var(--accent-cyan);">
+                            <img class="sighting-thumb" src="${primarySnap}" alt="${ent.name}">
+                            <div class="sighting-body">
+                                <div class="sighting-title">
+                                    <span class="sighting-label">🏷️ ${ent.name}</span>
+                                    <span class="entity-pill">${ent.sightings_count} Sighting${ent.sightings_count > 1 ? 's' : ''}</span>
+                                </div>
+                                <div class="sighting-time">🕒 Last Seen: ${ent.last_seen}</div>
+                                
+                                <button class="btn btn-sm" style="margin-top: 0.5rem;" onclick="toggleEntityHistory('ent-${ent.id}')">
+                                    📂 View Appearance History (${sightingsList.length})
+                                </button>
+
+                                <div id="ent-${ent.id}" style="display: none; margin-top: 0.75rem; border-top: 1px solid var(--border-color); padding-top: 0.5rem;">
+                                    ${sightingsList.map((s, idx) => `
+                                        <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.4rem 0; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 0.8rem;">
+                                            <span>#${idx+1} ${s.timestamp.slice(11, 19)} (${Math.round(s.confidence*100)}%)</span>
+                                            <div style="display: flex; gap: 0.3rem;">
+                                                ${s.clip_filename ? `<button class="btn btn-sm" style="padding: 0.2rem 0.5rem;" onclick="playClip('${s.clip_filename}', '${ent.name} - ${s.timestamp}')">▶ Play</button>` : ''}
+                                                <a class="btn btn-sm" style="padding: 0.2rem 0.5rem;" href="/api/media/snapshots/${s.snapshot_filename}" target="_blank">📸</a>
+                                            </div>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                });
+
+                // Render Untagged / Unassigned Sightings
+                if (untagged.length > 0) {
+                    html += `
+                        <div style="grid-column: 1 / -1; margin-top: 1rem;">
+                            <h3 style="font-size: 1rem; color: var(--text-muted); margin-bottom: 0.5rem;">Untagged Sightings (${untagged.length})</h3>
+                        </div>
+                    `;
+
+                    untagged.forEach(s => {
+                        html += `
+                            <div class="sighting-card">
+                                <img class="sighting-thumb" src="/api/media/snapshots/${s.snapshot_filename}" alt="${s.label}" loading="lazy">
+                                <div class="sighting-body">
+                                    <div class="sighting-title">
+                                        <span class="sighting-label">${s.label}</span>
+                                        <span class="sighting-conf">${Math.round(s.confidence * 100)}%</span>
+                                    </div>
+                                    <div class="sighting-time">📅 ${s.timestamp}</div>
+                                    
+                                    <div class="sighting-actions">
+                                        ${s.clip_filename ? `<button class="btn btn-sm" onclick="playClip('${s.clip_filename}', '${s.label} - ${s.timestamp}')">▶ Play Clip</button>` : ''}
+                                        <a class="btn btn-sm" href="/api/media/snapshots/${s.snapshot_filename}" target="_blank">📸 1080p</a>
+                                    </div>
+
+                                    <div class="tag-input-row">
+                                        <input type="text" class="tag-input" id="tag-${s.id}" placeholder="Tag (e.g. stefan)">
+                                        <button class="btn btn-sm" onclick="saveTag(${s.id})">Tag</button>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    });
+                }
+
+                container.innerHTML = html;
+            } catch(e) {
+                container.innerHTML = '<p style="color: var(--alert-red); padding: 2rem;">Error loading entities.</p>';
+            }
+        }
+
+        function toggleEntityHistory(elementId) {
+            const el = document.getElementById(elementId);
+            if (el.style.display === 'none') {
+                el.style.display = 'block';
+            } else {
+                el.style.display = 'none';
+            }
+        }
+
+        // 2. All Sightings Timeline View
+        async function loadAllSightings() {
+            const container = document.getElementById('sightings-container');
+            container.innerHTML = '<p style="color: var(--text-muted); padding: 2rem;">Loading chronological feed...</p>';
+            try {
+                const res = await fetch('/api/events?limit=40');
                 const sightings = await res.json();
                 document.getElementById('sightings-count').innerText = sightings.length;
-                const container = document.getElementById('sightings-container');
                 
                 if (sightings.length === 0) {
-                    container.innerHTML = '<p style="color: var(--text-muted); padding: 2rem;">No events recorded yet. Walk in front of the camera to trigger your first sighting!</p>';
+                    container.innerHTML = '<p style="color: var(--text-muted); padding: 2rem;">No events recorded yet.</p>';
                     return;
                 }
 
@@ -694,12 +827,12 @@ HTML_TEMPLATE = """
                             ${s.entity_name ? `<div class="entity-pill">🏷️ ${s.entity_name}</div>` : ''}
                             
                             <div class="sighting-actions">
-                                ${s.clip_filename ? `<button class="btn btn-sm" onclick="playClip('${s.clip_filename}', '${s.label} - ${s.timestamp}')">▶ Play 10s Clip</button>` : ''}
+                                ${s.clip_filename ? `<button class="btn btn-sm" onclick="playClip('${s.clip_filename}', '${s.label} - ${s.timestamp}')">▶ Play Clip</button>` : ''}
                                 <a class="btn btn-sm" href="/api/media/snapshots/${s.snapshot_filename}" target="_blank">📸 1080p Frame</a>
                             </div>
 
                             <div class="tag-input-row">
-                                <input type="text" class="tag-input" id="tag-${s.id}" placeholder="Tag identity (e.g. My Car)">
+                                <input type="text" class="tag-input" id="tag-${s.id}" placeholder="Tag identity (e.g. stefan)">
                                 <button class="btn btn-sm" onclick="saveTag(${s.id})">Tag</button>
                             </div>
                         </div>
@@ -719,7 +852,7 @@ HTML_TEMPLATE = """
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ name })
                 });
-                loadSightings();
+                refreshCurrentSightingsView();
             } catch(e) {
                 alert('Failed to save tag');
             }
@@ -729,9 +862,12 @@ HTML_TEMPLATE = """
             const modal = document.getElementById('video-modal');
             const player = document.getElementById('player');
             document.getElementById('modal-title').innerText = title;
+            
+            player.pause();
             player.src = '/api/media/clips/' + filename;
             modal.classList.add('open');
-            player.play();
+            player.load();
+            player.play().catch(e => console.log('Autoplay waiting for user gesture:', e));
         }
 
         function closeModal() {
