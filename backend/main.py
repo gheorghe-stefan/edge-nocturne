@@ -25,7 +25,7 @@ camera: VideoCamera = None
 
 class TagRequest(BaseModel):
     name: str
-    category: Optional[str] = "other"
+    category: Optional[str] = None
 
 
 class ContinuousSettingRequest(BaseModel):

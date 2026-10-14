@@ -73,6 +73,39 @@ def init_db():
     if "embedding_json" not in columns:
         cursor.execute("ALTER TABLE sightings ADD COLUMN embedding_json TEXT;")
 
+    # Ensure existing entities with 'other' category inherit category from their sightings
+    cursor.execute("""
+        UPDATE entities
+        SET category = (
+            SELECT s.category FROM sightings s 
+            WHERE s.entity_id = entities.id AND s.category != 'other' 
+            ORDER BY s.id DESC LIMIT 1
+        )
+        WHERE (category = 'other' OR category IS NULL) AND EXISTS (
+            SELECT 1 FROM sightings s WHERE s.entity_id = entities.id AND s.category != 'other'
+        );
+    """)
+
+    # Ensure any entities with NULL embedding_json get populated from their existing sightings
+    cursor.execute("SELECT id FROM entities WHERE embedding_json IS NULL")
+    for row in cursor.fetchall():
+        ent_id = row[0]
+        cursor.execute(
+            "SELECT embedding_json FROM sightings WHERE entity_id = ? AND embedding_json IS NOT NULL",
+            (ent_id,),
+        )
+        s_rows = cursor.fetchall()
+        if s_rows:
+            centroid = None
+            for idx, sr in enumerate(s_rows):
+                emb = json.loads(sr[0])
+                centroid = fingerprint_engine.merge_embeddings(centroid, emb, count=idx)
+            if centroid:
+                cursor.execute(
+                    "UPDATE entities SET embedding_json = ? WHERE id = ?",
+                    (json.dumps(centroid), ent_id),
+                )
+
     conn.commit()
     conn.close()
 
@@ -157,9 +190,14 @@ def find_matching_entity(
 
     conn = get_db_connection()
     cursor = conn.cursor()
+    # Match on specific category OR fallback if entity was categorized as 'other'
     cursor.execute(
-        "SELECT id, name, category, embedding_json FROM entities WHERE category = ? AND embedding_json IS NOT NULL",
-        (category,),
+        """
+        SELECT id, name, category, embedding_json 
+        FROM entities 
+        WHERE (category = ? OR category = 'other' OR ? = 'other') AND embedding_json IS NOT NULL
+        """,
+        (category, category),
     )
     rows = cursor.fetchall()
     conn.close()
@@ -184,22 +222,82 @@ def find_matching_entity(
 
 
 def auto_match_sightings_for_entity(entity_id: int, min_similarity: float = 0.70) -> int:
-    """Retroactively scans untagged sightings and links any that match this entity's embedding."""
+    """Retroactively scans untagged sightings and links any that match this entity's embedding using competitive matching."""
     conn = get_db_connection()
     cursor = conn.cursor()
 
     cursor.execute("SELECT id, name, category, embedding_json FROM entities WHERE id = ?", (entity_id,))
     ent = cursor.fetchone()
-    if not ent or not ent["embedding_json"]:
+    if not ent:
         conn.close()
         return 0
 
-    entity_emb = json.loads(ent["embedding_json"])
+    entity_emb = None
+    if ent["embedding_json"]:
+        try:
+            entity_emb = json.loads(ent["embedding_json"])
+        except Exception:
+            pass
+
+    # If entity has no embedding, compute centroid from its existing tagged sightings
+    if not entity_emb:
+        cursor.execute(
+            "SELECT id, snapshot_filename, metadata_json, embedding_json, category FROM sightings WHERE entity_id = ? ORDER BY id ASC",
+            (entity_id,),
+        )
+        existing_sightings = cursor.fetchall()
+        for idx, es in enumerate(existing_sightings):
+            emb = None
+            if es["embedding_json"]:
+                emb = json.loads(es["embedding_json"])
+            elif es["snapshot_filename"]:
+                snap_path = os.path.join(EVENTS_DIR, es["snapshot_filename"])
+                if os.path.exists(snap_path):
+                    import cv2
+                    img = cv2.imread(snap_path)
+                    if img is not None:
+                        meta = json.loads(es["metadata_json"]) if es["metadata_json"] else {}
+                        box = meta.get("box")
+                        emb = fingerprint_engine.extract_embedding(img, box)
+                        cursor.execute(
+                            "UPDATE sightings SET embedding_json = ? WHERE id = ?",
+                            (json.dumps(emb), es["id"]),
+                        )
+            if emb:
+                entity_emb = fingerprint_engine.merge_embeddings(entity_emb, emb, count=idx)
+                if ent["category"] == "other" and es["category"] != "other":
+                    cursor.execute("UPDATE entities SET category = ? WHERE id = ?", (es["category"], entity_id))
+
+        if entity_emb:
+            cursor.execute("UPDATE entities SET embedding_json = ? WHERE id = ?", (json.dumps(entity_emb), entity_id))
+            conn.commit()
+
+    if not entity_emb:
+        conn.close()
+        return 0
+
     category = ent["category"]
 
+    # Preload all other entities for competitive separation
     cursor.execute(
-        "SELECT id, snapshot_filename, metadata_json, embedding_json FROM sightings WHERE entity_id IS NULL AND category = ?",
-        (category,),
+        """
+        SELECT id, embedding_json 
+        FROM entities 
+        WHERE id != ? AND (category = ? OR category = 'other' OR ? = 'other') AND embedding_json IS NOT NULL
+        """,
+        (entity_id, category, category),
+    )
+    other_entities = []
+    for o_row in cursor.fetchall():
+        try:
+            other_entities.append((o_row["id"], json.loads(o_row["embedding_json"])))
+        except Exception:
+            pass
+
+    # Query untagged sightings matching category (or any if entity is 'other')
+    cursor.execute(
+        "SELECT id, snapshot_filename, metadata_json, embedding_json FROM sightings WHERE entity_id IS NULL AND (category = ? OR ? = 'other')",
+        (category, category),
     )
     untagged_rows = cursor.fetchall()
 
@@ -229,7 +327,15 @@ def auto_match_sightings_for_entity(entity_id: int, min_similarity: float = 0.70
         if emb:
             sim = fingerprint_engine.cosine_similarity(entity_emb, emb)
             if sim >= min_similarity:
-                matched_ids.append(row["id"])
+                # Competitive matching: ensure target entity is the highest-scoring entity
+                is_best = True
+                for _, other_emb in other_entities:
+                    other_sim = fingerprint_engine.cosine_similarity(other_emb, emb)
+                    if other_sim > sim:
+                        is_best = False
+                        break
+                if is_best:
+                    matched_ids.append(row["id"])
 
     for mid in matched_ids:
         cursor.execute("UPDATE sightings SET entity_id = ? WHERE id = ?", (entity_id, mid))
@@ -245,41 +351,50 @@ def auto_match_sightings_for_entity(entity_id: int, min_similarity: float = 0.70
     return len(matched_ids)
 
 
-def tag_sighting_entity(sighting_id: int, entity_name: str, category: str = "other") -> int:
+def tag_sighting_entity(sighting_id: int, entity_name: str, category: Optional[str] = None) -> int:
     """Associates a sighting with an entity identity, updates visual fingerprint, and auto-matches similar sightings."""
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # 1. Fetch sighting embedding (or extract from snapshot if missing)
+    # 1. Fetch sighting embedding (or extract from snapshot if missing) and sighting's actual category
     cursor.execute(
-        "SELECT id, snapshot_filename, metadata_json, embedding_json FROM sightings WHERE id = ?",
+        "SELECT id, category, snapshot_filename, metadata_json, embedding_json FROM sightings WHERE id = ?",
         (sighting_id,),
     )
     sighting = cursor.fetchone()
+    if not sighting:
+        conn.close()
+        return 0
+
+    sighting_cat = sighting["category"] or "other"
+    if not category or category == "other":
+        category = sighting_cat
 
     sighting_emb = None
-    if sighting:
-        if sighting["embedding_json"]:
-            try:
-                sighting_emb = json.loads(sighting["embedding_json"])
-            except Exception:
-                pass
-        if not sighting_emb and sighting["snapshot_filename"]:
-            snap_path = os.path.join(EVENTS_DIR, sighting["snapshot_filename"])
-            if os.path.exists(snap_path):
-                import cv2
-                img = cv2.imread(snap_path)
-                if img is not None:
-                    meta = json.loads(sighting["metadata_json"]) if sighting["metadata_json"] else {}
-                    box = meta.get("box")
-                    sighting_emb = fingerprint_engine.extract_embedding(img, box)
-                    cursor.execute(
-                        "UPDATE sightings SET embedding_json = ? WHERE id = ?",
-                        (json.dumps(sighting_emb), sighting_id),
-                    )
+    if sighting["embedding_json"]:
+        try:
+            sighting_emb = json.loads(sighting["embedding_json"])
+        except Exception:
+            pass
+    if not sighting_emb and sighting["snapshot_filename"]:
+        snap_path = os.path.join(EVENTS_DIR, sighting["snapshot_filename"])
+        if os.path.exists(snap_path):
+            import cv2
+            img = cv2.imread(snap_path)
+            if img is not None:
+                meta = json.loads(sighting["metadata_json"]) if sighting["metadata_json"] else {}
+                box = meta.get("box")
+                sighting_emb = fingerprint_engine.extract_embedding(img, box)
+                cursor.execute(
+                    "UPDATE sightings SET embedding_json = ? WHERE id = ?",
+                    (json.dumps(sighting_emb), sighting_id),
+                )
 
-    # 2. Get or create entity
-    cursor.execute("SELECT id, total_sightings, embedding_json FROM entities WHERE name = ?", (entity_name,))
+    # 2. Get or create entity (case-insensitive lookup)
+    cursor.execute(
+        "SELECT id, category, total_sightings, embedding_json FROM entities WHERE LOWER(name) = LOWER(?)",
+        (entity_name.strip(),),
+    )
     row = cursor.fetchone()
 
     if row:
@@ -294,19 +409,22 @@ def tag_sighting_entity(sighting_id: int, entity_name: str, category: str = "oth
         )
         new_emb_str = json.dumps(new_centroid) if new_centroid else None
 
+        # Upgrade category if entity was 'other'
+        ent_cat = category if (row["category"] == "other" and category != "other") else row["category"]
+
         cursor.execute(
             """
             UPDATE entities 
-            SET last_seen = CURRENT_TIMESTAMP, total_sightings = total_sightings + 1, embedding_json = ?
+            SET last_seen = CURRENT_TIMESTAMP, total_sightings = total_sightings + 1, embedding_json = ?, category = ?
             WHERE id = ?
             """,
-            (new_emb_str, entity_id),
+            (new_emb_str, ent_cat, entity_id),
         )
     else:
         new_emb_str = json.dumps(sighting_emb) if sighting_emb else None
         cursor.execute(
             "INSERT INTO entities (name, category, embedding_json) VALUES (?, ?, ?)",
-            (entity_name, category, new_emb_str),
+            (entity_name.strip(), category, new_emb_str),
         )
         entity_id = cursor.lastrowid
 
@@ -322,7 +440,7 @@ def tag_sighting_entity(sighting_id: int, entity_name: str, category: str = "oth
 
 
 def backfill_sightings_embeddings() -> int:
-    """Backfills missing embeddings for existing historical sightings from their snapshots."""
+    """Backfills missing embeddings for existing historical sightings and repairs entity centroid embeddings."""
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, snapshot_filename, metadata_json FROM sightings WHERE embedding_json IS NULL")
@@ -344,6 +462,30 @@ def backfill_sightings_embeddings() -> int:
                         (json.dumps(emb), r["id"]),
                     )
                     updated_count += 1
+
+    # Repair any entities with missing embeddings or 'other' category
+    cursor.execute("SELECT id, name, category, embedding_json FROM entities")
+    entities = cursor.fetchall()
+    for ent in entities:
+        ent_id = ent["id"]
+        cursor.execute(
+            "SELECT embedding_json, category FROM sightings WHERE entity_id = ? AND embedding_json IS NOT NULL",
+            (ent_id,),
+        )
+        ent_sightings = cursor.fetchall()
+        if ent_sightings:
+            centroid = None
+            detected_cat = ent["category"]
+            for idx, s in enumerate(ent_sightings):
+                s_emb = json.loads(s[0])
+                centroid = fingerprint_engine.merge_embeddings(centroid, s_emb, count=idx)
+                if detected_cat == "other" and s[1] != "other":
+                    detected_cat = s[1]
+            if centroid:
+                cursor.execute(
+                    "UPDATE entities SET embedding_json = ?, category = ? WHERE id = ?",
+                    (json.dumps(centroid), detected_cat, ent_id),
+                )
 
     conn.commit()
     conn.close()
