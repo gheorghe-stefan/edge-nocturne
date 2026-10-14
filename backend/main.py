@@ -10,6 +10,8 @@ from pydantic import BaseModel
 from backend.camera import VideoCamera
 from backend.database import (
     EVENTS_DIR,
+    auto_match_sightings_for_entity,
+    backfill_sightings_embeddings,
     get_grouped_entities,
     get_recent_sightings,
     get_storage_stats,
@@ -35,6 +37,13 @@ async def lifespan(app: FastAPI):
     global camera
     print(f"[INFO] Initializing Edge Nocturne v{__version__}...")
     init_db()
+    try:
+        backfilled = backfill_sightings_embeddings()
+        if backfilled > 0:
+            print(f"[INFO] Backfilled visual embeddings for {backfilled} historical sightings.")
+    except Exception as e:
+        print(f"[WARN] Backfill error: {e}")
+
     camera = VideoCamera(device_id=0, width=1920, height=1080, fps=30, enable_ml=True)
     yield
     print("[INFO] Shutting down camera & recorder...")
@@ -45,11 +54,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Edge Nocturne", version=__version__, lifespan=lifespan)
 
 
-def generate_mjpeg_stream():
-    """Generator yielding multipart JPEG frames for live browser streaming."""
+def generate_mjpeg_stream(resolution: str = "1080p"):
+    """Generator yielding multipart JPEG frames for live browser streaming at requested resolution."""
     while True:
         if camera:
-            frame_bytes = camera.get_jpeg_bytes(quality=80)
+            frame_bytes = camera.get_jpeg_bytes(quality=80, resolution=resolution)
             if frame_bytes:
                 yield (
                     b"--frame\r\n"
@@ -59,10 +68,10 @@ def generate_mjpeg_stream():
 
 
 @app.get("/api/stream")
-def video_stream():
-    """MJPEG low-latency streaming endpoint (Clean video stream)."""
+def video_stream(res: Optional[str] = "1080p"):
+    """MJPEG low-latency streaming endpoint with dynamic resolution selector (1080p, 720p, 480p)."""
     return StreamingResponse(
-        generate_mjpeg_stream(),
+        generate_mjpeg_stream(resolution=res),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
@@ -127,9 +136,23 @@ def list_entities():
 
 @app.post("/api/events/{sighting_id}/tag")
 def tag_event(sighting_id: int, req: TagRequest):
-    """Tags a sighting with an identity name (e.g. 'My VW Touran' or 'Fox #1')."""
+    """Tags a sighting with an identity name (e.g. 'My VW Touran' or 'Stefan')."""
     entity_id = tag_sighting_entity(sighting_id, req.name.strip(), req.category)
     return {"status": "ok", "entity_id": entity_id, "name": req.name.strip()}
+
+
+@app.post("/api/entities/{entity_id}/auto-match")
+def auto_match_entity(entity_id: int):
+    """Scans untagged sightings and retroactively links any matching this entity's visual fingerprint."""
+    matched_count = auto_match_sightings_for_entity(entity_id, min_similarity=0.70)
+    return {"status": "ok", "matched_count": matched_count}
+
+
+@app.post("/api/re-index")
+def trigger_reindex():
+    """Extracts missing embeddings from stored snapshot files."""
+    count = backfill_sightings_embeddings()
+    return {"status": "ok", "backfilled_count": count}
 
 
 @app.post("/api/settings/continuous")
@@ -383,6 +406,31 @@ HTML_TEMPLATE = """
         }
         input:checked + .slider { background-color: var(--status-green); }
         input:checked + .slider:before { transform: translateX(20px); }
+        .res-bar {
+            display: flex;
+            align-items: center;
+            gap: 0.35rem;
+            background: var(--bg-card);
+            padding: 0.3rem 0.6rem;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+        }
+        .res-btn {
+            background: transparent;
+            border: 1px solid transparent;
+            color: var(--text-muted);
+            padding: 0.3rem 0.6rem;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .res-btn.active {
+            background: rgba(0, 242, 254, 0.15);
+            color: var(--accent-cyan);
+            border-color: var(--accent-cyan);
+        }
         .btn {
             background: linear-gradient(135deg, #1e2942, #141b2d);
             color: var(--text-primary);
@@ -543,6 +591,7 @@ HTML_TEMPLATE = """
             <div class="brand-title">EDGE NOCTURNE</div>
         </div>
         <div class="meta-badges">
+            <button class="btn btn-sm" onclick="openTailscaleModal()" style="padding: 0.2rem 0.6rem; font-size: 0.8rem;">🌐 Remote Access</button>
             <div class="badge badge-detection" id="detection-badge">🟢 Scene Clear</div>
             <div class="badge" id="storage-badge">💾 Disk: --% Free</div>
             <div class="badge" id="latency-badge">⚡ LiteRT: -- ms</div>
@@ -578,8 +627,14 @@ HTML_TEMPLATE = """
                         <div style="font-size: 0.75rem; color: var(--text-muted);">Keep last 24h • 15% Min Free Guard</div>
                     </div>
                 </div>
-                <div style="display: flex; gap: 0.75rem;">
-                    <a class="btn" href="/api/snapshot" target="_blank">📸 Take Clean Snapshot</a>
+                <div class="res-bar">
+                    <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 600;">Stream:</span>
+                    <button class="res-btn active" id="btn-res-1080p" onclick="setResolution('1080p')">1080p</button>
+                    <button class="res-btn" id="btn-res-720p" onclick="setResolution('720p')">720p</button>
+                    <button class="res-btn" id="btn-res-480p" onclick="setResolution('480p')">480p</button>
+                </div>
+                <div style="display: flex; gap: 0.5rem;">
+                    <a class="btn" href="/api/snapshot" target="_blank">📸 Snapshot</a>
                     <button class="btn" onclick="toggleFullscreen()">⛶ Fullscreen</button>
                 </div>
             </div>
@@ -592,7 +647,10 @@ HTML_TEMPLATE = """
                     <button class="tab-btn active" id="btn-view-entities" onclick="switchSightingsSubView('entities')">👥 Unique Entities</button>
                     <button class="tab-btn" id="btn-view-all" onclick="switchSightingsSubView('all')">📅 All Sightings Feed</button>
                 </div>
-                <button class="btn btn-sm" onclick="refreshCurrentSightingsView()">🔄 Refresh</button>
+                <div style="display: flex; gap: 0.5rem;">
+                    <button class="btn btn-sm" onclick="triggerReindex()">🔍 Re-Scan Embeddings</button>
+                    <button class="btn btn-sm" onclick="refreshCurrentSightingsView()">🔄 Refresh</button>
+                </div>
             </div>
             <div class="sightings-grid" id="sightings-container">
                 <p style="color: var(--text-muted); padding: 2rem;">Loading detection events...</p>
@@ -608,6 +666,39 @@ HTML_TEMPLATE = """
                 <button class="modal-close" onclick="closeModal()">✕</button>
             </div>
             <video class="modal-video" id="player" controls playsinline preload="auto"></video>
+        </div>
+    </div>
+
+    <!-- Modal Tailscale Setup -->
+    <div class="modal" id="tailscale-modal">
+        <div class="modal-content" style="max-width: 580px; padding: 1.5rem;">
+            <div class="modal-header" style="border: none; padding: 0 0 1rem 0;">
+                <div style="font-size: 1.15rem; font-weight: 700; color: var(--accent-cyan); display: flex; align-items: center; gap: 0.5rem;">
+                    🌐 Tailscale VPN Remote Access
+                </div>
+                <button class="modal-close" onclick="closeTailscaleModal()">✕</button>
+            </div>
+            <p style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1.2rem; line-height: 1.4;">
+                Access your Edge Nocturne camera stream and historical sightings anywhere in the world from your smartphone or laptop securely without opening any ports or touching your home router.
+            </p>
+            <div style="background: rgba(0,0,0,0.3); border: 1px solid var(--border-color); border-radius: 8px; padding: 0.9rem; margin-bottom: 0.9rem; font-size: 0.82rem;">
+                <strong style="color: var(--text-primary); display: block; margin-bottom: 0.4rem;">1. Install & Login on Raspberry Pi (One-time)</strong>
+                <code style="background: #090e1a; padding: 0.4rem 0.6rem; border-radius: 4px; display: block; word-break: break-all; color: var(--accent-cyan); font-family: monospace;">
+                    curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up
+                </code>
+                <span style="color: var(--text-muted); display: block; margin-top: 0.4rem;">Click the Tailscale authentication URL shown in the terminal to connect your Pi to your account.</span>
+            </div>
+            <div style="background: rgba(0,0,0,0.3); border: 1px solid var(--border-color); border-radius: 8px; padding: 0.9rem; margin-bottom: 0.9rem; font-size: 0.82rem;">
+                <strong style="color: var(--text-primary); display: block; margin-bottom: 0.4rem;">2. Install Tailscale on your Smartphone</strong>
+                <span style="color: var(--text-muted);">Download the Tailscale app (iOS / Android), sign in with the same account, and turn VPN switch ON.</span>
+            </div>
+            <div style="background: rgba(0,0,0,0.3); border: 1px solid var(--border-color); border-radius: 8px; padding: 0.9rem; font-size: 0.82rem;">
+                <strong style="color: var(--text-primary); display: block; margin-bottom: 0.4rem;">3. Connect from Mobile Browser</strong>
+                <span style="color: var(--text-muted);">Open your browser on your phone outside Wi-Fi and navigate to: <code style="color: var(--status-green);">http://&lt;Pi-Tailscale-IP&gt;:8000</code>.</span>
+            </div>
+            <div style="text-align: right; margin-top: 1.2rem;">
+                <button class="btn btn-sm" onclick="closeTailscaleModal()">Got it</button>
+            </div>
         </div>
     </div>
 
@@ -732,9 +823,14 @@ HTML_TEMPLATE = """
                                 </div>
                                 <div class="sighting-time">🕒 Last Seen: ${ent.last_seen}</div>
                                 
-                                <button class="btn btn-sm" style="margin-top: 0.5rem;" onclick="toggleEntityHistory('ent-${ent.id}')">
-                                    📂 View Appearance History (${sightingsList.length})
-                                </button>
+                                <div style="display: flex; gap: 0.4rem; margin-top: 0.5rem; flex-wrap: wrap;">
+                                    <button class="btn btn-sm" onclick="toggleEntityHistory('ent-${ent.id}')">
+                                        📂 History (${sightingsList.length})
+                                    </button>
+                                    <button class="btn btn-sm" style="background: rgba(0, 242, 254, 0.12); border-color: var(--accent-cyan); color: var(--accent-cyan);" onclick="autoMatchEntity(${ent.id}, '${ent.name}')">
+                                        ⚡ Auto-Match
+                                    </button>
+                                </div>
 
                                 <div id="ent-${ent.id}" style="display: none; margin-top: 0.75rem; border-top: 1px solid var(--border-color); padding-top: 0.5rem;">
                                     ${sightingsList.map((s, idx) => `
@@ -856,6 +952,49 @@ HTML_TEMPLATE = """
             } catch(e) {
                 alert('Failed to save tag');
             }
+        }
+
+        let currentResolution = '1080p';
+        function setResolution(res) {
+            currentResolution = res;
+            document.querySelectorAll('.res-btn').forEach(b => b.classList.remove('active'));
+            const btn = document.getElementById('btn-res-' + res);
+            if (btn) btn.classList.add('active');
+            
+            const feed = document.querySelector('.video-feed');
+            if (feed) {
+                feed.src = '/api/stream?res=' + res + '&t=' + Date.now();
+            }
+        }
+
+        async function autoMatchEntity(id, name) {
+            try {
+                const res = await fetch('/api/entities/' + id + '/auto-match', { method: 'POST' });
+                const data = await res.json();
+                alert(`⚡ Matched and grouped ${data.matched_count || 0} sightings into '${name}'!`);
+                refreshCurrentSightingsView();
+            } catch(e) {
+                alert('Auto-matching failed: ' + e);
+            }
+        }
+
+        async function triggerReindex() {
+            try {
+                const res = await fetch('/api/re-index', { method: 'POST' });
+                const data = await res.json();
+                alert(`Extracted embeddings for ${data.backfilled_count || 0} snapshots.`);
+                refreshCurrentSightingsView();
+            } catch(e) {
+                alert('Re-indexing failed: ' + e);
+            }
+        }
+
+        function openTailscaleModal() {
+            document.getElementById('tailscale-modal').classList.add('open');
+        }
+
+        function closeTailscaleModal() {
+            document.getElementById('tailscale-modal').classList.remove('open');
         }
 
         function playClip(filename, title) {

@@ -12,9 +12,11 @@ from backend.database import (
     ARCHIVE_DIR,
     CONTINUOUS_DIR,
     EVENTS_DIR,
+    find_matching_entity,
     get_storage_stats,
     log_sighting,
 )
+from backend.fingerprint import fingerprint_engine
 
 
 class VideoRecorder:
@@ -160,7 +162,23 @@ class VideoRecorder:
 
         self.is_recording_event = False
 
-        # 4. Log sighting to SQLite database
+        # 4. Extract Tier 2 visual embedding and check for existing entity match
+        embedding = None
+        matched_entity_id = None
+        if pre_roll_frames and best_frame is not None:
+            try:
+                embedding = fingerprint_engine.extract_embedding(best_frame, best_det.get("box"))
+                matched_entity_id, matched_name, sim = find_matching_entity(
+                    embedding, category=best_det.get("category", "other"), min_similarity=0.70
+                )
+                if matched_entity_id:
+                    print(
+                        f"[RE-ID] Auto-matched sighting to '{matched_name}' (confidence: {sim:.2f})"
+                    )
+            except Exception as e:
+                print(f"[WARN] Error extracting embedding: {e}")
+
+        # 5. Log sighting to SQLite database
         log_sighting(
             label=best_det.get("label", "unknown"),
             category=best_det.get("category", "other"),
@@ -168,6 +186,8 @@ class VideoRecorder:
             snapshot_filename=snap_filename,
             clip_filename=clip_filename,
             metadata={"box": best_det.get("box"), "resolution": f"{self.width}x{self.height}"},
+            embedding=embedding,
+            entity_id=matched_entity_id,
         )
         print(f"[RECORDER] Sighting recorded: {best_det.get('label')} -> {clip_filename}")
 

@@ -112,11 +112,16 @@ class VideoCamera:
         with self.ml_lock:
             return list(self.latest_detections), self.inference_ms
 
-    def get_jpeg_bytes(self, quality: int = 80) -> Optional[bytes]:
-        """Encodes the clean raw frame as JPEG bytes for HTTP streaming."""
+    def get_jpeg_bytes(self, quality: int = 80, resolution: Optional[str] = "1080p") -> Optional[bytes]:
+        """Encodes the clean raw frame as JPEG bytes for HTTP streaming at requested resolution."""
         success, frame = self.get_latest_frame()
         if not success or frame is None:
             return None
+
+        if resolution == "720p":
+            frame = cv2.resize(frame, (1280, 720))
+        elif resolution == "480p":
+            frame = cv2.resize(frame, (640, 480))
 
         encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
         ret, buffer = cv2.imencode(".jpg", frame, encode_params)
