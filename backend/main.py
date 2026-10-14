@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 from backend.camera import VideoCamera
+from backend.version import __version__
 
 camera: VideoCamera = None
 
@@ -11,7 +12,7 @@ camera: VideoCamera = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global camera
-    print("[INFO] Initializing Arducam Video Capture & LiteRT Engine...")
+    print(f"[INFO] Initializing Arducam Video Capture & LiteRT Engine (v{__version__})...")
     camera = VideoCamera(device_id=0, width=1280, height=720, fps=30, enable_ml=True)
     yield
     print("[INFO] Releasing camera resources...")
@@ -19,7 +20,7 @@ async def lifespan(app: FastAPI):
         camera.stop()
 
 
-app = FastAPI(title="Edge Nocturne", lifespan=lifespan)
+app = FastAPI(title="Edge Nocturne", version=__version__, lifespan=lifespan)
 
 
 def generate_mjpeg_stream():
@@ -73,6 +74,7 @@ def get_system_stats():
 
     return {
         "status": "online",
+        "version": __version__,
         "cpu_temp": temp_str,
         "resolution": f"{camera.width}x{camera.height}" if camera else "offline",
         "fps": camera.fps if camera else 0,
@@ -84,7 +86,10 @@ def get_system_stats():
 @app.get("/", response_class=HTMLResponse)
 def index_page():
     """Dark-mode responsive web dashboard with live detection telemetry."""
-    return """
+    return HTML_TEMPLATE.replace("{{VERSION}}", __version__)
+
+
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -265,6 +270,7 @@ def index_page():
             <div class="badge" id="latency-badge">⚡ LiteRT: -- ms</div>
             <div class="badge" id="temp-badge">CPU: --°C</div>
             <div class="badge">1080P IR Stream</div>
+            <div class="badge" id="version-badge" style="font-family: monospace; color: var(--accent-cyan); font-weight: 600;">v{{VERSION}}</div>
         </div>
     </header>
     <main>
@@ -287,6 +293,11 @@ def index_page():
                 const res = await fetch('/api/stats');
                 const data = await res.json();
                 
+                // Version
+                if (data.version) {
+                    document.getElementById('version-badge').innerText = 'v' + data.version;
+                }
+
                 // CPU Temperature
                 if (data.cpu_temp) {
                     document.getElementById('temp-badge').innerText = 'CPU: ' + data.cpu_temp;
