@@ -11,12 +11,15 @@ class VideoCamera:
 
     def __init__(
         self,
-        device_id: int = 0,
+        device_id: Optional[int] = None,
         width: int = 1920,
         height: int = 1080,
         fps: int = 30,
         enable_ml: bool = True,
     ):
+        if device_id is None:
+            device_id = self._find_camera_device()
+
         self.device_id = device_id
         self.width = width
         self.height = height
@@ -31,6 +34,21 @@ class VideoCamera:
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
 
         self.grabbed, self.frame = self.cap.read()
+
+        # Fallback search if specified device failed to grab initial frame
+        if not self.grabbed:
+            print(f"[WARN] Failed to read initial frame from camera device {self.device_id}, scanning...")
+            self.cap.release()
+            discovered = self._find_camera_device()
+            if discovered != self.device_id:
+                self.device_id = discovered
+                self.cap = cv2.VideoCapture(self.device_id, cv2.CAP_V4L2)
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+                self.grabbed, self.frame = self.cap.read()
+
         self.frame_lock = threading.Lock()
         self.ml_lock = threading.Lock()
         self.stopped = False
@@ -57,6 +75,22 @@ class VideoCamera:
             except Exception as e:
                 print(f"[WARN] ObjectDetector initialization skipped: {e}")
                 self.detector = None
+
+    @staticmethod
+    def _find_camera_device() -> int:
+        for idx in range(10):
+            try:
+                cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+                if cap.isOpened():
+                    ret, _ = cap.read()
+                    cap.release()
+                    if ret:
+                        print(f"[INFO] Discovered camera on device index {idx}")
+                        return idx
+            except Exception:
+                continue
+        print("[WARN] No working camera device found on scan, defaulting to index 0")
+        return 0
 
     def _capture_loop(self):
         """Dedicated thread to constantly drain camera buffer at full frame rate."""

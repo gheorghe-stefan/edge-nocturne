@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[WARN] Backfill error: {e}")
 
-    camera = VideoCamera(device_id=0, width=1920, height=1080, fps=30, enable_ml=True)
+    camera = VideoCamera(device_id=None, width=1920, height=1080, fps=30, enable_ml=True)
     yield
     print("[INFO] Shutting down camera & recorder...")
     if camera:
