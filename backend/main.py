@@ -17,6 +17,7 @@ from backend.database import (
     get_storage_stats,
     init_db,
     merge_entities,
+    merge_multiple_entities,
     tag_sighting_entity,
 )
 from backend.version import __version__
@@ -31,6 +32,11 @@ class TagRequest(BaseModel):
 
 class MergeEntityRequest(BaseModel):
     target_id: int
+
+
+class MergeMultipleRequest(BaseModel):
+    entity_ids: list[int]
+    target_name: Optional[str] = None
 
 
 class ContinuousSettingRequest(BaseModel):
@@ -159,6 +165,17 @@ def auto_match_entity(entity_id: int):
 def merge_entity(source_id: int, req: MergeEntityRequest):
     """Merges all sightings and visual embedding prototypes from source_id into target_id."""
     res = merge_entities(source_id, req.target_id)
+    if res.get("status") == "error":
+        raise HTTPException(status_code=400, detail=res.get("message"))
+    return res
+
+
+@app.post("/api/entities/merge-multiple")
+def merge_multiple(req: MergeMultipleRequest):
+    """Merges multiple selected entities into one unified entity."""
+    if len(req.entity_ids) < 2:
+        raise HTTPException(status_code=400, detail="At least 2 entities required for merging")
+    res = merge_multiple_entities(req.entity_ids, req.target_name)
     if res.get("status") == "error":
         raise HTTPException(status_code=400, detail=res.get("message"))
     return res
@@ -826,13 +843,43 @@ HTML_TEMPLATE = """
 
                 let html = '';
 
+                // If groups are selected for merging, render the action bar
+                if (selectedMergeSet.size > 0) {
+                    const selectedList = entities.filter(e => selectedMergeSet.has(e.id));
+                    const selectedNames = selectedList.map(e => e.name).join(', ');
+                    html += `
+                        <div style="grid-column: 1 / -1; background: rgba(168, 85, 247, 0.12); border: 1px solid #a855f7; border-radius: 8px; padding: 0.8rem 1.2rem; display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; gap: 0.8rem;">
+                            <div>
+                                <strong style="color: #c084fc;">🔗 ${selectedMergeSet.size} Group${selectedMergeSet.size > 1 ? 's' : ''} Selected:</strong>
+                                <span style="color: var(--text-muted); font-size: 0.85rem; margin-left: 0.4rem;">${selectedNames}</span>
+                            </div>
+                            <div style="display: flex; gap: 0.6rem; align-items: center;">
+                                ${selectedMergeSet.size >= 2 ? `
+                                    <button class="btn btn-sm" style="background: linear-gradient(135deg, #a855f7, #6366f1); color: #fff; font-weight: 600; padding: 0.45rem 1.1rem; box-shadow: 0 0 12px rgba(168, 85, 247, 0.4);" onclick="executeBatchMerge()">
+                                        ✨ Merge all into same entity
+                                    </button>
+                                ` : `
+                                    <span style="color: var(--text-muted); font-size: 0.8rem;">Select at least 1 more group to merge</span>
+                                `}
+                                <button class="btn btn-sm" style="background: rgba(255, 255, 255, 0.08);" onclick="clearMergeSelection()">
+                                    ✕ Clear
+                                </button>
+                            </div>
+                        </div>
+                    `;
+                }
+
                 // Render Identified Entities
                 entities.forEach(ent => {
                     const primarySnap = ent.primary_snapshot ? `/api/media/snapshots/${ent.primary_snapshot}` : '';
                     const sightingsList = ent.sightings || [];
+                    const isSelected = selectedMergeSet.has(ent.id);
+                    const cardBorder = isSelected 
+                        ? 'border: 2px solid #a855f7; box-shadow: 0 0 15px rgba(168, 85, 247, 0.35);' 
+                        : 'border: 1px solid var(--accent-cyan);';
 
                     html += `
-                        <div class="sighting-card" style="border: 1px solid var(--accent-cyan);">
+                        <div class="sighting-card" style="${cardBorder}">
                             <img class="sighting-thumb" src="${primarySnap}" alt="${ent.name}">
                             <div class="sighting-body">
                                 <div class="sighting-title">
@@ -848,8 +895,8 @@ HTML_TEMPLATE = """
                                     <button class="btn btn-sm" style="background: rgba(0, 242, 254, 0.12); border-color: var(--accent-cyan); color: var(--accent-cyan);" onclick="autoMatchEntity(${ent.id}, '${ent.name}')">
                                         ⚡ Auto-Match
                                     </button>
-                                    <button class="btn btn-sm" style="background: rgba(168, 85, 247, 0.15); border-color: #a855f7; color: #c084fc;" onclick="promptMergeEntity(${ent.id}, '${ent.name}')">
-                                        🔗 Merge
+                                    <button class="btn btn-sm" style="${isSelected ? 'background: #a855f7; border-color: #c084fc; color: #fff; font-weight: 600;' : 'background: rgba(168, 85, 247, 0.15); border-color: #a855f7; color: #c084fc;'}" onclick="toggleMergeSelect(${ent.id})">
+                                        ${isSelected ? '✓ Selected' : '🔗 Merge'}
                                     </button>
                                 </div>
 
@@ -999,47 +1046,59 @@ HTML_TEMPLATE = """
             }
         }
 
-        async function promptMergeEntity(sourceId, sourceName) {
-            const otherEntities = allEntitiesCache.filter(e => e.id !== sourceId);
-            if (otherEntities.length === 0) {
-                alert('No other entities available to merge into.');
+        const selectedMergeSet = new Set();
+
+        function toggleMergeSelect(entityId) {
+            if (selectedMergeSet.has(entityId)) {
+                selectedMergeSet.delete(entityId);
+            } else {
+                selectedMergeSet.add(entityId);
+            }
+            loadGroupedEntities();
+        }
+
+        function clearMergeSelection() {
+            selectedMergeSet.clear();
+            loadGroupedEntities();
+        }
+
+        async function executeBatchMerge() {
+            if (selectedMergeSet.size < 2) {
+                alert('Please select at least 2 entities to merge.');
                 return;
             }
+
+            const selectedEntities = allEntitiesCache.filter(e => selectedMergeSet.has(e.id));
+            const defaultTarget = selectedEntities.reduce((max, e) => ((e.sightings_count || 0) > (max.sightings_count || 0) ? e : max), selectedEntities[0]);
+            const namesList = selectedEntities.map(e => e.name).join(', ');
 
             const nl = String.fromCharCode(10);
-            const optionsText = otherEntities.map((e, idx) => `${idx + 1}. ${e.name} (${e.sightings_count} sightings)`).join(nl);
-            const msg = `Merge '${sourceName}' into which entity?` + nl + nl +
-                        `Enter the number (1-${otherEntities.length}) or exact name:` + nl + nl +
-                        optionsText;
-            const choice = prompt(msg);
-            if (!choice) return;
+            const promptMsg = `Merging ${selectedEntities.length} groups: [${namesList}]` + nl + nl +
+                              `Enter the target identity name (e.g. 'Stefan'):`;
+            const chosenName = prompt(promptMsg, defaultTarget.name);
+            if (chosenName === null) return;
 
-            let target = null;
-            const num = parseInt(choice.trim(), 10);
-            if (!isNaN(num) && num >= 1 && num <= otherEntities.length) {
-                target = otherEntities[num - 1];
-            } else {
-                target = otherEntities.find(e => e.name.toLowerCase() === choice.trim().toLowerCase());
-            }
+            const targetName = chosenName.trim() || defaultTarget.name;
 
-            if (!target) {
-                alert('Invalid selection.');
-                return;
-            }
-
-            if (!confirm(`Confirm merge: Move all sightings of '${sourceName}' into '${target.name}' and combine their visual identity?`)) {
+            if (!confirm(`Confirm Merge:` + nl +
+                         `Merge [${namesList}] into '${targetName}'?` + nl +
+                         `All sightings will be united and their visual profiles combined.`)) {
                 return;
             }
 
             try {
-                const res = await fetch(`/api/entities/${sourceId}/merge`, {
+                const res = await fetch('/api/entities/merge-multiple', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ target_id: target.id })
+                    body: JSON.stringify({
+                        entity_ids: Array.from(selectedMergeSet),
+                        target_name: targetName
+                    })
                 });
                 const data = await res.json();
                 if (data.status === 'ok') {
-                    alert(`Merged '${sourceName}' into '${target.name}' (${data.moved_sightings} sightings moved).`);
+                    alert(`✨ Successfully merged into '${data.target_name}' (${data.total_sightings} total sightings)!`);
+                    selectedMergeSet.clear();
                     refreshCurrentSightingsView();
                 } else {
                     alert(`Merge failed: ${data.detail || data.message}`);

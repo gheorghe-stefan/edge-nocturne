@@ -515,6 +515,101 @@ def merge_entities(source_id: int, target_id: int) -> Dict[str, Any]:
     }
 
 
+def merge_multiple_entities(entity_ids: List[int], target_name: Optional[str] = None) -> Dict[str, Any]:
+    """Merges a list of entity IDs into a single unified entity."""
+    unique_ids = []
+    for eid in entity_ids:
+        if eid not in unique_ids:
+            unique_ids.append(eid)
+
+    if len(unique_ids) < 2:
+        return {"status": "error", "message": "At least 2 unique entities required for merging"}
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    placeholders = ",".join("?" for _ in unique_ids)
+    cursor.execute(
+        f"SELECT id, name, category, total_sightings, first_seen, last_seen, embedding_json FROM entities WHERE id IN ({placeholders})",
+        unique_ids,
+    )
+    rows = cursor.fetchall()
+
+    if len(rows) < 2:
+        conn.close()
+        return {"status": "error", "message": f"Only found {len(rows)} matching entities in database"}
+
+    target_ent = None
+    if target_name:
+        for r in rows:
+            if r["name"].strip().lower() == target_name.strip().lower():
+                target_ent = r
+                break
+
+    if not target_ent:
+        target_ent = max(rows, key=lambda r: (r["total_sightings"] or 0))
+
+    target_id = target_ent["id"]
+    sources = [r for r in rows if r["id"] != target_id]
+    final_name = target_name.strip() if target_name and target_name.strip() else target_ent["name"]
+
+    total_moved = 0
+    current_count = target_ent["total_sightings"] or 0
+    first_seen = target_ent["first_seen"]
+    last_seen = target_ent["last_seen"]
+    cat = target_ent["category"]
+    current_emb = json.loads(target_ent["embedding_json"]) if target_ent["embedding_json"] else None
+    merged_source_names = []
+
+    for src in sources:
+        sid = src["id"]
+        s_count = src["total_sightings"] or 0
+        merged_source_names.append(src["name"])
+
+        # Move sightings
+        cursor.execute("UPDATE sightings SET entity_id = ? WHERE entity_id = ?", (target_id, sid))
+        total_moved += cursor.rowcount
+
+        # Metrics
+        current_count += s_count
+        if src["first_seen"]:
+            first_seen = min(first_seen, src["first_seen"]) if first_seen else src["first_seen"]
+        if src["last_seen"]:
+            last_seen = max(last_seen, src["last_seen"]) if last_seen else src["last_seen"]
+        if cat == "other" and src["category"] != "other":
+            cat = src["category"]
+
+        s_emb = json.loads(src["embedding_json"]) if src["embedding_json"] else None
+        current_emb = fingerprint_engine.merge_embeddings(current_emb, s_emb, count=current_count)
+
+        # Delete source entity
+        cursor.execute("DELETE FROM entities WHERE id = ?", (sid,))
+
+    final_emb_str = json.dumps(current_emb) if current_emb else None
+    cursor.execute(
+        """
+        UPDATE entities
+        SET name = ?, total_sightings = ?, first_seen = ?, last_seen = ?, embedding_json = ?, category = ?
+        WHERE id = ?
+        """,
+        (final_name, current_count, first_seen, last_seen, final_emb_str, cat, target_id),
+    )
+
+    conn.commit()
+    conn.close()
+
+    print(f"[ENTITY BATCH MERGE] Merged {len(sources)} entities ({merged_source_names}) into '{final_name}' (ID {target_id}) with {total_moved} sightings.")
+
+    return {
+        "status": "ok",
+        "target_id": target_id,
+        "target_name": final_name,
+        "merged_sources": merged_source_names,
+        "moved_sightings": total_moved,
+        "total_sightings": current_count,
+    }
+
+
 def backfill_sightings_embeddings(force_recompute: bool = False) -> int:
     """Backfills missing or upgrades embeddings for existing historical sightings and repairs entity centroid embeddings."""
     conn = get_db_connection()
