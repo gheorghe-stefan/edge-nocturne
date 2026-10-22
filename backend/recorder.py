@@ -96,6 +96,26 @@ class VideoRecorder:
         if best_det.get("confidence", 0.0) < 0.60:
             return False
 
+        # Motion verification gate: Reject static inanimate fixtures (e.g. ceiling lamps, furniture)
+        with self.buffer_lock:
+            if len(self.frame_buffer) >= 20:
+                cur_f = self.frame_buffer[-1]
+                old_f = self.frame_buffer[0]
+                box = best_det.get("box")
+                if box and len(box) == 4:
+                    h, w = cur_f.shape[:2]
+                    y1 = max(0, int(box[0] * h))
+                    x1 = max(0, int(box[1] * w))
+                    y2 = min(h, int(box[2] * h))
+                    x2 = min(w, int(box[3] * w))
+                    if y2 > y1 + 15 and x2 > x1 + 15:
+                        cur_crop = cur_f[y1:y2, x1:x2]
+                        old_crop = old_f[y1:y2, x1:x2]
+                        diff = cv2.absdiff(cur_crop, old_crop)
+                        mean_diff = float(np.mean(diff))
+                        if mean_diff < 3.5:
+                            return False  # Static scene artifact, ignore
+
         self.is_recording_event = True
         self.last_event_time = now
 

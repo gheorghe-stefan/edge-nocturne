@@ -610,6 +610,58 @@ def merge_multiple_entities(entity_ids: List[int], target_name: Optional[str] = 
     }
 
 
+def delete_entity(entity_id: int, delete_sightings: bool = True) -> Dict[str, Any]:
+    """Deletes an entity (e.g. false alarm). If delete_sightings is True, also removes its associated sightings and media files."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT id, name FROM entities WHERE id = ?", (entity_id,))
+    ent = cursor.fetchone()
+    if not ent:
+        conn.close()
+        return {"status": "error", "message": "Entity not found"}
+
+    name = ent["name"]
+    removed_sightings = 0
+
+    if delete_sightings:
+        cursor.execute("SELECT snapshot_filename, clip_filename FROM sightings WHERE entity_id = ?", (entity_id,))
+        sightings = cursor.fetchall()
+        for s in sightings:
+            if s["snapshot_filename"]:
+                sp = os.path.join(EVENTS_DIR, s["snapshot_filename"])
+                if os.path.exists(sp):
+                    try:
+                        os.remove(sp)
+                    except Exception:
+                        pass
+            if s["clip_filename"]:
+                cp = os.path.join(EVENTS_DIR, s["clip_filename"])
+                if os.path.exists(cp):
+                    try:
+                        os.remove(cp)
+                    except Exception:
+                        pass
+
+        cursor.execute("DELETE FROM sightings WHERE entity_id = ?", (entity_id,))
+        removed_sightings = cursor.rowcount
+    else:
+        cursor.execute("UPDATE sightings SET entity_id = NULL WHERE entity_id = ?", (entity_id,))
+        removed_sightings = cursor.rowcount
+
+    cursor.execute("DELETE FROM entities WHERE id = ?", (entity_id,))
+    conn.commit()
+    conn.close()
+
+    print(f"[ENTITY DELETED] Removed entity '{name}' (ID {entity_id}) and {removed_sightings} sightings.")
+    return {
+        "status": "ok",
+        "deleted_entity_id": entity_id,
+        "deleted_name": name,
+        "removed_sightings": removed_sightings,
+    }
+
+
 def backfill_sightings_embeddings(force_recompute: bool = False) -> int:
     """Backfills missing or upgrades embeddings for existing historical sightings and repairs entity centroid embeddings."""
     conn = get_db_connection()

@@ -12,6 +12,7 @@ from backend.database import (
     EVENTS_DIR,
     auto_match_sightings_for_entity,
     backfill_sightings_embeddings,
+    delete_entity,
     get_grouped_entities,
     get_recent_sightings,
     get_storage_stats,
@@ -176,6 +177,15 @@ def merge_multiple(req: MergeMultipleRequest):
     if len(req.entity_ids) < 2:
         raise HTTPException(status_code=400, detail="At least 2 entities required for merging")
     res = merge_multiple_entities(req.entity_ids, req.target_name)
+    if res.get("status") == "error":
+        raise HTTPException(status_code=400, detail=res.get("message"))
+    return res
+
+
+@app.delete("/api/entities/{entity_id}")
+def remove_entity(entity_id: int, delete_sightings: bool = True):
+    """Deletes an entity and optionally removes its false alarm sightings and media files."""
+    res = delete_entity(entity_id, delete_sightings=delete_sightings)
     if res.get("status") == "error":
         raise HTTPException(status_code=400, detail=res.get("message"))
     return res
@@ -823,9 +833,14 @@ HTML_TEMPLATE = """
 
         // 1. Grouped Unique Entities View
         let allEntitiesCache = [];
-        async function loadGroupedEntities() {
+        const selectedMergeSet = new Set();
+
+        async function loadGroupedEntities(showSpinner = false) {
             const container = document.getElementById('sightings-container');
-            container.innerHTML = '<p style="color: var(--text-muted); padding: 2rem;">Loading unique subjects...</p>';
+            const savedScrollY = window.scrollY;
+            if (showSpinner || allEntitiesCache.length === 0) {
+                container.innerHTML = '<p style="color: var(--text-muted); padding: 2rem;">Loading unique subjects...</p>';
+            }
             try {
                 const res = await fetch('/api/entities');
                 const data = await res.json();
@@ -841,33 +856,7 @@ HTML_TEMPLATE = """
                     return;
                 }
 
-                let html = '';
-
-                // If groups are selected for merging, render the action bar
-                if (selectedMergeSet.size > 0) {
-                    const selectedList = entities.filter(e => selectedMergeSet.has(e.id));
-                    const selectedNames = selectedList.map(e => e.name).join(', ');
-                    html += `
-                        <div style="grid-column: 1 / -1; background: rgba(168, 85, 247, 0.12); border: 1px solid #a855f7; border-radius: 8px; padding: 0.8rem 1.2rem; display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; gap: 0.8rem;">
-                            <div>
-                                <strong style="color: #c084fc;">🔗 ${selectedMergeSet.size} Group${selectedMergeSet.size > 1 ? 's' : ''} Selected:</strong>
-                                <span style="color: var(--text-muted); font-size: 0.85rem; margin-left: 0.4rem;">${selectedNames}</span>
-                            </div>
-                            <div style="display: flex; gap: 0.6rem; align-items: center;">
-                                ${selectedMergeSet.size >= 2 ? `
-                                    <button class="btn btn-sm" style="background: linear-gradient(135deg, #a855f7, #6366f1); color: #fff; font-weight: 600; padding: 0.45rem 1.1rem; box-shadow: 0 0 12px rgba(168, 85, 247, 0.4);" onclick="executeBatchMerge()">
-                                        ✨ Merge all into same entity
-                                    </button>
-                                ` : `
-                                    <span style="color: var(--text-muted); font-size: 0.8rem;">Select at least 1 more group to merge</span>
-                                `}
-                                <button class="btn btn-sm" style="background: rgba(255, 255, 255, 0.08);" onclick="clearMergeSelection()">
-                                    ✕ Clear
-                                </button>
-                            </div>
-                        </div>
-                    `;
-                }
+                let html = '<div id="merge-action-bar" style="grid-column: 1 / -1; display: none;"></div>';
 
                 // Render Identified Entities
                 entities.forEach(ent => {
@@ -879,7 +868,7 @@ HTML_TEMPLATE = """
                         : 'border: 1px solid var(--accent-cyan);';
 
                     html += `
-                        <div class="sighting-card" style="${cardBorder}">
+                        <div class="sighting-card" id="card-ent-${ent.id}" style="${cardBorder}">
                             <img class="sighting-thumb" src="${primarySnap}" alt="${ent.name}">
                             <div class="sighting-body">
                                 <div class="sighting-title">
@@ -895,8 +884,11 @@ HTML_TEMPLATE = """
                                     <button class="btn btn-sm" style="background: rgba(0, 242, 254, 0.12); border-color: var(--accent-cyan); color: var(--accent-cyan);" onclick="autoMatchEntity(${ent.id}, '${ent.name}')">
                                         ⚡ Auto-Match
                                     </button>
-                                    <button class="btn btn-sm" style="${isSelected ? 'background: #a855f7; border-color: #c084fc; color: #fff; font-weight: 600;' : 'background: rgba(168, 85, 247, 0.15); border-color: #a855f7; color: #c084fc;'}" onclick="toggleMergeSelect(${ent.id})">
+                                    <button class="btn btn-sm" id="btn-merge-${ent.id}" style="${isSelected ? 'background: #a855f7; border-color: #c084fc; color: #fff; font-weight: 600;' : 'background: rgba(168, 85, 247, 0.15); border-color: #a855f7; color: #c084fc;'}" onclick="toggleMergeSelect(${ent.id})">
                                         ${isSelected ? '✓ Selected' : '🔗 Merge'}
+                                    </button>
+                                    <button class="btn btn-sm" style="background: rgba(255, 68, 68, 0.12); border-color: #ff4444; color: #ff6b6b; padding: 0.35rem 0.6rem;" title="Delete False Alarm" onclick="deleteEntityPrompt(${ent.id}, '${ent.name}', ${ent.sightings_count})">
+                                        🗑️
                                     </button>
                                 </div>
 
@@ -951,6 +943,10 @@ HTML_TEMPLATE = """
                 }
 
                 container.innerHTML = html;
+                updateMergeBar();
+                if (savedScrollY > 0) {
+                    window.scrollTo({ top: savedScrollY, behavior: 'instant' });
+                }
             } catch(e) {
                 container.innerHTML = '<p style="color: var(--alert-red); padding: 2rem;">Error loading entities.</p>';
             }
@@ -1046,20 +1042,105 @@ HTML_TEMPLATE = """
             }
         }
 
-        const selectedMergeSet = new Set();
-
         function toggleMergeSelect(entityId) {
             if (selectedMergeSet.has(entityId)) {
                 selectedMergeSet.delete(entityId);
             } else {
                 selectedMergeSet.add(entityId);
             }
-            loadGroupedEntities();
+
+            const isSel = selectedMergeSet.has(entityId);
+            const card = document.getElementById('card-ent-' + entityId);
+            const btn = document.getElementById('btn-merge-' + entityId);
+
+            if (card) {
+                card.style.border = isSel ? '2px solid #a855f7' : '1px solid var(--accent-cyan)';
+                card.style.boxShadow = isSel ? '0 0 15px rgba(168, 85, 247, 0.35)' : 'none';
+            }
+            if (btn) {
+                btn.style.background = isSel ? '#a855f7' : 'rgba(168, 85, 247, 0.15)';
+                btn.style.borderColor = isSel ? '#c084fc' : '#a855f7';
+                btn.style.color = isSel ? '#fff' : '#c084fc';
+                btn.style.fontWeight = isSel ? '600' : 'normal';
+                btn.innerHTML = isSel ? '✓ Selected' : '🔗 Merge';
+            }
+
+            updateMergeBar();
+        }
+
+        function updateMergeBar() {
+            const bar = document.getElementById('merge-action-bar');
+            if (!bar) return;
+            if (selectedMergeSet.size === 0) {
+                bar.style.display = 'none';
+                return;
+            }
+            bar.style.display = 'block';
+            const selectedList = allEntitiesCache.filter(e => selectedMergeSet.has(e.id));
+            const selectedNames = selectedList.map(e => e.name).join(', ');
+            const count = selectedMergeSet.size;
+
+            bar.innerHTML = `
+                <div style="background: rgba(168, 85, 247, 0.12); border: 1px solid #a855f7; border-radius: 8px; padding: 0.8rem 1.2rem; display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; gap: 0.8rem;">
+                    <div>
+                        <strong style="color: #c084fc;">🔗 ${count} Group${count > 1 ? 's' : ''} Selected:</strong>
+                        <span style="color: var(--text-muted); font-size: 0.85rem; margin-left: 0.4rem;">${selectedNames}</span>
+                    </div>
+                    <div style="display: flex; gap: 0.6rem; align-items: center;">
+                        ${count >= 2 ? `
+                            <button class="btn btn-sm" style="background: linear-gradient(135deg, #a855f7, #6366f1); color: #fff; font-weight: 600; padding: 0.45rem 1.1rem; box-shadow: 0 0 12px rgba(168, 85, 247, 0.4);" onclick="executeBatchMerge()">
+                                ✨ Merge all into same entity
+                            </button>
+                        ` : `
+                            <span style="color: var(--text-muted); font-size: 0.8rem;">Select at least 1 more group to merge</span>
+                        `}
+                        <button class="btn btn-sm" style="background: rgba(255, 255, 255, 0.08);" onclick="clearMergeSelection()">
+                            ✕ Clear
+                        </button>
+                    </div>
+                </div>
+            `;
         }
 
         function clearMergeSelection() {
             selectedMergeSet.clear();
-            loadGroupedEntities();
+            allEntitiesCache.forEach(ent => {
+                const card = document.getElementById('card-ent-' + ent.id);
+                const btn = document.getElementById('btn-merge-' + ent.id);
+                if (card) {
+                    card.style.border = '1px solid var(--accent-cyan)';
+                    card.style.boxShadow = 'none';
+                }
+                if (btn) {
+                    btn.style.background = 'rgba(168, 85, 247, 0.15)';
+                    btn.style.borderColor = '#a855f7';
+                    btn.style.color = '#c084fc';
+                    btn.style.fontWeight = 'normal';
+                    btn.innerHTML = '🔗 Merge';
+                }
+            });
+            updateMergeBar();
+        }
+
+        async function deleteEntityPrompt(id, name, count) {
+            const nl = String.fromCharCode(10);
+            if (!confirm(`Delete entity '${name}' and remove its ${count} sightings?` + nl + nl +
+                         `Use this to remove false alarm detections (e.g. ceiling lamps, chairs).`)) {
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/entities/' + id + '?delete_sightings=true', { method: 'DELETE' });
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    selectedMergeSet.delete(id);
+                    refreshCurrentSightingsView();
+                } else {
+                    alert('Delete failed: ' + (data.detail || data.message));
+                }
+            } catch(e) {
+                alert('Delete error: ' + e);
+            }
         }
 
         async function executeBatchMerge() {

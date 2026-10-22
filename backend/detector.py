@@ -13,11 +13,11 @@ except ImportError:
     except ImportError:
         from tensorflow.lite.python.interpreter import Interpreter
 
-# Target category groupings for clean reporting
+# Target category groupings for clean reporting (relevant domestic security classes)
 CATEGORIES = {
     "person": ["person"],
-    "vehicle": ["car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "bicycle"],
-    "animal": ["bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"],
+    "vehicle": ["car", "motorcycle", "bus", "truck", "bicycle"],
+    "animal": ["cat", "dog", "bird"],
 }
 
 
