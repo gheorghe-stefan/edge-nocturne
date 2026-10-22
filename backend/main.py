@@ -42,12 +42,9 @@ async def lifespan(app: FastAPI):
     global camera
     print(f"[INFO] Initializing Edge Nocturne v{__version__}...")
     init_db()
-    try:
-        backfilled = backfill_sightings_embeddings()
-        if backfilled > 0:
-            print(f"[INFO] Backfilled visual embeddings for {backfilled} historical sightings.")
-    except Exception as e:
-        print(f"[WARN] Backfill error: {e}")
+    # Run backfill asynchronously in background so web server starts immediately
+    import threading
+    threading.Thread(target=backfill_sightings_embeddings, daemon=True).start()
 
     camera = VideoCamera(device_id=None, width=1920, height=1080, fps=30, enable_ml=True)
     yield

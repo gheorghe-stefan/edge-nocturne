@@ -522,7 +522,7 @@ def backfill_sightings_embeddings(force_recompute: bool = False) -> int:
     if force_recompute:
         cursor.execute("SELECT id, snapshot_filename, metadata_json, category FROM sightings WHERE snapshot_filename IS NOT NULL")
     else:
-        cursor.execute("SELECT id, snapshot_filename, metadata_json, category FROM sightings WHERE embedding_json IS NULL OR embedding_json NOT LIKE '%version%'")
+        cursor.execute("SELECT id, snapshot_filename, metadata_json, category FROM sightings WHERE embedding_json IS NULL")
     rows = cursor.fetchall()
     updated_count = 0
 
