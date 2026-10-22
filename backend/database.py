@@ -256,7 +256,7 @@ def auto_match_sightings_for_entity(
                     if img is not None:
                         meta = json.loads(es["metadata_json"]) if es["metadata_json"] else {}
                         box = meta.get("box")
-                        emb = fingerprint_engine.extract_embedding(img, box)
+                        emb = fingerprint_engine.extract_embedding(img, box, category=es["category"])
                         cursor.execute(
                             "UPDATE sightings SET embedding_json = ? WHERE id = ?",
                             (json.dumps(emb), es["id"]),
@@ -316,7 +316,7 @@ def auto_match_sightings_for_entity(
                 if img is not None:
                     meta = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
                     box = meta.get("box")
-                    emb = fingerprint_engine.extract_embedding(img, box)
+                    emb = fingerprint_engine.extract_embedding(img, box, category=category)
                     cursor.execute(
                         "UPDATE sightings SET embedding_json = ? WHERE id = ?",
                         (json.dumps(emb), row["id"]),
@@ -382,7 +382,7 @@ def tag_sighting_entity(sighting_id: int, entity_name: str, category: Optional[s
             if img is not None:
                 meta = json.loads(sighting["metadata_json"]) if sighting["metadata_json"] else {}
                 box = meta.get("box")
-                sighting_emb = fingerprint_engine.extract_embedding(img, box)
+                sighting_emb = fingerprint_engine.extract_embedding(img, box, category=category)
                 cursor.execute(
                     "UPDATE sightings SET embedding_json = ? WHERE id = ?",
                     (json.dumps(sighting_emb), sighting_id),
@@ -437,11 +437,92 @@ def tag_sighting_entity(sighting_id: int, entity_name: str, category: Optional[s
     return entity_id
 
 
-def backfill_sightings_embeddings() -> int:
-    """Backfills missing embeddings for existing historical sightings and repairs entity centroid embeddings."""
+def merge_entities(source_id: int, target_id: int) -> Dict[str, Any]:
+    """Merges all sightings and visual embedding prototypes from source_id into target_id, then deletes source_id."""
+    if source_id == target_id:
+        return {"status": "error", "message": "Cannot merge an entity into itself"}
+
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, snapshot_filename, metadata_json FROM sightings WHERE embedding_json IS NULL")
+
+    cursor.execute(
+        "SELECT id, name, category, total_sightings, first_seen, last_seen, embedding_json FROM entities WHERE id = ?",
+        (source_id,),
+    )
+    source = cursor.fetchone()
+
+    cursor.execute(
+        "SELECT id, name, category, total_sightings, first_seen, last_seen, embedding_json FROM entities WHERE id = ?",
+        (target_id,),
+    )
+    target = cursor.fetchone()
+
+    if not source or not target:
+        conn.close()
+        return {"status": "error", "message": "Source or target entity not found"}
+
+    # 1. Move all sightings from source to target
+    cursor.execute("UPDATE sightings SET entity_id = ? WHERE entity_id = ?", (target_id, source_id))
+    moved_count = cursor.rowcount
+
+    # 2. Combine metrics
+    target_count = target["total_sightings"] or 0
+    source_count = source["total_sightings"] or 0
+    total_count = target_count + source_count
+
+    dates = [d for d in [target["first_seen"], source["first_seen"]] if d]
+    first_seen = min(dates) if dates else None
+
+    dates_last = [d for d in [target["last_seen"], source["last_seen"]] if d]
+    last_seen = max(dates_last) if dates_last else None
+
+    # 3. Merge embeddings
+    target_emb = json.loads(target["embedding_json"]) if target["embedding_json"] else None
+    source_emb = json.loads(source["embedding_json"]) if source["embedding_json"] else None
+    merged_emb = fingerprint_engine.merge_embeddings(target_emb, source_emb, count=target_count)
+    merged_emb_str = json.dumps(merged_emb) if merged_emb else None
+
+    # Upgrade category if needed
+    cat = target["category"]
+    if cat == "other" and source["category"] != "other":
+        cat = source["category"]
+
+    cursor.execute(
+        """
+        UPDATE entities
+        SET total_sightings = ?, first_seen = ?, last_seen = ?, embedding_json = ?, category = ?
+        WHERE id = ?
+        """,
+        (total_count, first_seen, last_seen, merged_emb_str, cat, target_id),
+    )
+
+    # 4. Delete source entity
+    cursor.execute("DELETE FROM entities WHERE id = ?", (source_id,))
+
+    conn.commit()
+    conn.close()
+
+    print(f"[ENTITY MERGE] Merged '{source['name']}' (ID {source_id}) into '{target['name']}' (ID {target_id}) with {moved_count} sightings.")
+
+    return {
+        "status": "ok",
+        "source_id": source_id,
+        "source_name": source["name"],
+        "target_id": target_id,
+        "target_name": target["name"],
+        "moved_sightings": moved_count,
+        "total_sightings": total_count,
+    }
+
+
+def backfill_sightings_embeddings(force_recompute: bool = False) -> int:
+    """Backfills missing or upgrades embeddings for existing historical sightings and repairs entity centroid embeddings."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if force_recompute:
+        cursor.execute("SELECT id, snapshot_filename, metadata_json, category FROM sightings WHERE snapshot_filename IS NOT NULL")
+    else:
+        cursor.execute("SELECT id, snapshot_filename, metadata_json, category FROM sightings WHERE embedding_json IS NULL OR embedding_json NOT LIKE '%version%'")
     rows = cursor.fetchall()
     updated_count = 0
 
@@ -454,7 +535,7 @@ def backfill_sightings_embeddings() -> int:
                 if img is not None:
                     meta = json.loads(r["metadata_json"]) if r["metadata_json"] else {}
                     box = meta.get("box")
-                    emb = fingerprint_engine.extract_embedding(img, box)
+                    emb = fingerprint_engine.extract_embedding(img, box, category=r["category"])
                     cursor.execute(
                         "UPDATE sightings SET embedding_json = ? WHERE id = ?",
                         (json.dumps(emb), r["id"]),

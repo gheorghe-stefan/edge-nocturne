@@ -9,6 +9,7 @@ storage/
 *.db
 *.sqlite3
 models/*.tflite
+models/*.onnx
 models/*.zip
 
 # Byte-compiled / optimized / DLL files

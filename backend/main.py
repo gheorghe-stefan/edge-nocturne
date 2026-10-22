@@ -16,6 +16,7 @@ from backend.database import (
     get_recent_sightings,
     get_storage_stats,
     init_db,
+    merge_entities,
     tag_sighting_entity,
 )
 from backend.version import __version__
@@ -26,6 +27,10 @@ camera: VideoCamera = None
 class TagRequest(BaseModel):
     name: str
     category: Optional[str] = None
+
+
+class MergeEntityRequest(BaseModel):
+    target_id: int
 
 
 class ContinuousSettingRequest(BaseModel):
@@ -153,10 +158,19 @@ def auto_match_entity(entity_id: int):
     return {"status": "ok", "matched_count": matched_count}
 
 
+@app.post("/api/entities/{source_id}/merge")
+def merge_entity(source_id: int, req: MergeEntityRequest):
+    """Merges all sightings and visual embedding prototypes from source_id into target_id."""
+    res = merge_entities(source_id, req.target_id)
+    if res.get("status") == "error":
+        raise HTTPException(status_code=400, detail=res.get("message"))
+    return res
+
+
 @app.post("/api/re-index")
-def trigger_reindex():
-    """Extracts missing embeddings from stored snapshot files."""
-    count = backfill_sightings_embeddings()
+def trigger_reindex(force: bool = False):
+    """Extracts missing or upgraded embeddings from stored snapshot files."""
+    count = backfill_sightings_embeddings(force_recompute=force)
     return {"status": "ok", "backfilled_count": count}
 
 
@@ -794,6 +808,7 @@ HTML_TEMPLATE = """
         }
 
         // 1. Grouped Unique Entities View
+        let allEntitiesCache = [];
         async function loadGroupedEntities() {
             const container = document.getElementById('sightings-container');
             container.innerHTML = '<p style="color: var(--text-muted); padding: 2rem;">Loading unique subjects...</p>';
@@ -802,6 +817,7 @@ HTML_TEMPLATE = """
                 const data = await res.json();
                 const entities = data.entities || [];
                 const untagged = data.untagged || [];
+                allEntitiesCache = entities;
                 
                 const totalCount = entities.reduce((sum, e) => sum + (e.sightings_count || 0), 0) + untagged.length;
                 document.getElementById('sightings-count').innerText = totalCount;
@@ -834,6 +850,9 @@ HTML_TEMPLATE = """
                                     </button>
                                     <button class="btn btn-sm" style="background: rgba(0, 242, 254, 0.12); border-color: var(--accent-cyan); color: var(--accent-cyan);" onclick="autoMatchEntity(${ent.id}, '${ent.name}')">
                                         ⚡ Auto-Match
+                                    </button>
+                                    <button class="btn btn-sm" style="background: rgba(168, 85, 247, 0.15); border-color: #a855f7; color: #c084fc;" onclick="promptMergeEntity(${ent.id}, '${ent.name}')">
+                                        🔗 Merge
                                     </button>
                                 </div>
 
@@ -980,6 +999,52 @@ HTML_TEMPLATE = """
                 refreshCurrentSightingsView();
             } catch(e) {
                 alert('Auto-matching failed: ' + e);
+            }
+        }
+
+        async function promptMergeEntity(sourceId, sourceName) {
+            const otherEntities = allEntitiesCache.filter(e => e.id !== sourceId);
+            if (otherEntities.length === 0) {
+                alert('No other entities available to merge into.');
+                return;
+            }
+
+            const optionsText = otherEntities.map((e, idx) => `${idx + 1}. ${e.name} (${e.sightings_count} sightings)`).join('\n');
+            const choice = prompt(`Merge '${sourceName}' into which entity?\n\nEnter the number (1-${otherEntities.length}) or exact name:\n\n${optionsText}`);
+            if (!choice) return;
+
+            let target = null;
+            const num = parseInt(choice.trim(), 10);
+            if (!isNaN(num) && num >= 1 && num <= otherEntities.length) {
+                target = otherEntities[num - 1];
+            } else {
+                target = otherEntities.find(e => e.name.toLowerCase() === choice.trim().toLowerCase());
+            }
+
+            if (!target) {
+                alert('Invalid selection.');
+                return;
+            }
+
+            if (!confirm(`Confirm merge: Move all sightings of '${sourceName}' into '${target.name}' and combine their visual identity?`)) {
+                return;
+            }
+
+            try {
+                const res = await fetch(`/api/entities/${sourceId}/merge`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ target_id: target.id })
+                });
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    alert(`Merged '${sourceName}' into '${target.name}' (${data.moved_sightings} sightings moved).`);
+                    refreshCurrentSightingsView();
+                } else {
+                    alert(`Merge failed: ${data.detail || data.message}`);
+                }
+            } catch(e) {
+                alert('Merge error: ' + e);
             }
         }
 

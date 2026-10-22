@@ -1,4 +1,8 @@
-"""Helper script to download pre-trained quantized MobileNet-SSD COCO TFLite model and labels."""
+"""Helper script to download pre-trained ML models:
+1. Google LiteRT Quantized MobileNet-SSD COCO detector
+2. OpenCV YuNet deep face detector with 5-point landmark alignment
+3. OpenCV SFace deep face recognition embedding model
+"""
 
 import os
 import urllib.request
@@ -8,8 +12,13 @@ MODELS_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_URL = "https://raw.githubusercontent.com/google-coral/test_data/master/ssd_mobilenet_v2_coco_quant_postprocess.tflite"
 LABELS_URL = "https://raw.githubusercontent.com/google-coral/test_data/master/coco_labels.txt"
 
+YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+SFACE_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
+
 MODEL_PATH = os.path.join(MODELS_DIR, "ssd_mobilenet_v2_coco.tflite")
 LABELS_PATH = os.path.join(MODELS_DIR, "coco_labels.txt")
+YUNET_PATH = os.path.join(MODELS_DIR, "face_detection_yunet_2023mar.onnx")
+SFACE_PATH = os.path.join(MODELS_DIR, "face_recognition_sface_2021dec.onnx")
 
 
 def download_file(url: str, dest_path: str):
@@ -26,6 +35,8 @@ def main():
     os.makedirs(MODELS_DIR, exist_ok=True)
     download_file(MODEL_URL, MODEL_PATH)
     download_file(LABELS_URL, LABELS_PATH)
+    download_file(YUNET_URL, YUNET_PATH)
+    download_file(SFACE_URL, SFACE_PATH)
     print("\n[READY] All model assets downloaded successfully into models/ directory.")
 
 

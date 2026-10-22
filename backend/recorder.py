@@ -175,7 +175,9 @@ class VideoRecorder:
         matched_entity_id = None
         if pre_roll_frames and best_frame is not None:
             try:
-                embedding = fingerprint_engine.extract_embedding(best_frame, best_det.get("box"))
+                embedding = fingerprint_engine.extract_embedding(
+                    best_frame, best_det.get("box"), category=best_det.get("category", "other")
+                )
                 matched_entity_id, matched_name, sim = find_matching_entity(
                     embedding, category=best_det.get("category", "other"), min_similarity=0.88, min_margin=0.03
                 )
