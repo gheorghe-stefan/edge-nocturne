@@ -86,29 +86,6 @@ def init_db():
         );
     """)
 
-    # Ensure cross-contamination is eliminated: Stefan was present during early setup (id <= 18), Monica at desk (id > 18)
-    cursor.execute("UPDATE sightings SET entity_id = 1 WHERE id <= 18")
-    cursor.execute("UPDATE sightings SET entity_id = 2 WHERE id > 18 AND entity_id = 1")
-
-    # Recompute pure centroids for Stefan and Monica
-    cursor.execute("SELECT embedding_json FROM sightings WHERE entity_id = 1 AND embedding_json IS NOT NULL")
-    s_rows = cursor.fetchall()
-    if s_rows:
-        stefan_c = None
-        for idx, sr in enumerate(s_rows):
-            stefan_c = fingerprint_engine.merge_embeddings(stefan_c, json.loads(sr[0]), count=idx)
-        if stefan_c:
-            cursor.execute("UPDATE entities SET embedding_json = ?, total_sightings = ? WHERE id = 1", (json.dumps(stefan_c), len(s_rows)))
-
-    cursor.execute("SELECT embedding_json FROM sightings WHERE entity_id = 2 AND embedding_json IS NOT NULL")
-    m_rows = cursor.fetchall()
-    if m_rows:
-        monica_c = None
-        for idx, mr in enumerate(m_rows):
-            monica_c = fingerprint_engine.merge_embeddings(monica_c, json.loads(mr[0]), count=idx)
-        if monica_c:
-            cursor.execute("UPDATE entities SET embedding_json = ?, total_sightings = ? WHERE id = 2", (json.dumps(monica_c), len(m_rows)))
-
     conn.commit()
     conn.close()
 
