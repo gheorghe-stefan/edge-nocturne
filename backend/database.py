@@ -432,7 +432,7 @@ def tag_sighting_entity(sighting_id: int, entity_name: str, category: Optional[s
     conn.close()
 
     # 4. Auto-match all other past sightings matching this entity!
-    auto_match_sightings_for_entity(entity_id, min_similarity=0.70)
+    auto_match_sightings_for_entity(entity_id, min_similarity=0.88, min_margin=0.03)
 
     return entity_id
 

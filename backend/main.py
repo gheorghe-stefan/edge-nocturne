@@ -149,7 +149,7 @@ def tag_event(sighting_id: int, req: TagRequest):
 @app.post("/api/entities/{entity_id}/auto-match")
 def auto_match_entity(entity_id: int):
     """Scans untagged sightings and retroactively links any matching this entity's visual fingerprint."""
-    matched_count = auto_match_sightings_for_entity(entity_id, min_similarity=0.70)
+    matched_count = auto_match_sightings_for_entity(entity_id, min_similarity=0.88, min_margin=0.03)
     return {"status": "ok", "matched_count": matched_count}
 
 
