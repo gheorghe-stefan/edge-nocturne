@@ -1006,8 +1006,12 @@ HTML_TEMPLATE = """
                 return;
             }
 
-            const optionsText = otherEntities.map((e, idx) => `${idx + 1}. ${e.name} (${e.sightings_count} sightings)`).join('\n');
-            const choice = prompt(`Merge '${sourceName}' into which entity?\n\nEnter the number (1-${otherEntities.length}) or exact name:\n\n${optionsText}`);
+            const nl = String.fromCharCode(10);
+            const optionsText = otherEntities.map((e, idx) => `${idx + 1}. ${e.name} (${e.sightings_count} sightings)`).join(nl);
+            const msg = `Merge '${sourceName}' into which entity?` + nl + nl +
+                        `Enter the number (1-${otherEntities.length}) or exact name:` + nl + nl +
+                        optionsText;
+            const choice = prompt(msg);
             if (!choice) return;
 
             let target = null;
