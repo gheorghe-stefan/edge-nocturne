@@ -145,8 +145,9 @@ class VideoCamera:
                 except Exception as e:
                     print(f"[ERROR] Inference error: {e}")
 
-            # Pace inference to ~1.5 FPS (650ms cycle) for thermal stability and high accuracy
-            time.sleep(0.65)
+            # Pace inference to ~1.0 FPS (for 960x960) or ~1.5 FPS (for 640x640)
+            sleep_interval = 0.90 if (self.detector and self.detector.target_size >= 960) else 0.65
+            time.sleep(sleep_interval)
 
     def get_latest_frame(self) -> Tuple[bool, Optional[any]]:
         """Returns the most recent raw OpenCV BGR frame (clean, unadorned)."""

@@ -56,8 +56,11 @@ class ObjectDetector:
         self.net = None
         self.interpreter = None
 
-        # Check for YOLO ONNX model
-        if not os.path.exists(onnx_model_path):
+        # Check for YOLO ONNX model (prefer 960x960 for max wildlife/yard resolution, then 640x640)
+        if os.path.exists("models/yolov8n_960.onnx"):
+            onnx_model_path = "models/yolov8n_960.onnx"
+            self.target_size = 960
+        elif not os.path.exists(onnx_model_path):
             alt_path = "models/yolo11n.onnx"
             if os.path.exists(alt_path):
                 onnx_model_path = alt_path
@@ -69,7 +72,7 @@ class ObjectDetector:
                 self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
                 self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
                 self.is_yolo = True
-                print(f"[INFO] YOLO Detector ready! Resolution: {target_size}x{target_size} Letterbox")
+                print(f"[INFO] YOLO Detector ready! Resolution: {self.target_size}x{self.target_size} Letterbox")
                 return
             except Exception as e:
                 print(f"[WARN] Failed to load YOLO ONNX ({e}), attempting LiteRT fallback...")
