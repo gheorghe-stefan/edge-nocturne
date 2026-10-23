@@ -4,6 +4,7 @@ import time
 from typing import List, Optional, Tuple
 from backend.detector import ObjectDetector
 from backend.recorder import VideoRecorder
+from backend.tracker import MultiObjectTracker
 
 
 class VideoCamera:
@@ -61,6 +62,7 @@ class VideoCamera:
 
         # Initialize Dual-mode Video Recorder (Event pre-roll + continuous DVR loop)
         self.recorder = VideoRecorder(width=self.width, height=self.height, fps=self.fps)
+        self.tracker = MultiObjectTracker(min_iou=0.25, max_age=3, min_hits_for_active=2)
 
         # Thread 1: High-speed ingestion loop (30 FPS, zero lag)
         self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
@@ -109,7 +111,7 @@ class VideoCamera:
                 time.sleep(0.02)
 
     def _inference_loop(self):
-        """Asynchronous ML worker running inference on the newest frame."""
+        """Asynchronous ML worker running high-accuracy inference (~1.5 FPS) with online multi-object tracking."""
         while not self.stopped:
             if not self.detector:
                 time.sleep(0.5)
@@ -123,19 +125,28 @@ class VideoCamera:
                         self.latest_detections = detections
                         self.inference_ms = latency
 
-                    # Trigger event recording if person, vehicle, or animal is detected
-                    target_detections = [
-                        d for d in detections
-                        if d.get("category") in ("person", "vehicle", "animal")
-                    ]
-                    if target_detections:
-                        self.recorder.trigger_event(target_detections)
+                    # Update online multi-object tracker
+                    active_tracks = self.tracker.update(detections)
+
+                    # Trigger event recording if verified active moving targets exist
+                    if active_tracks:
+                        active_dets = [
+                            {
+                                "label": t.label,
+                                "category": t.category,
+                                "confidence": t.confidence,
+                                "box": t.box,
+                                "track_id": t.track_id,
+                            }
+                            for t in active_tracks
+                        ]
+                        self.recorder.trigger_event(active_dets)
 
                 except Exception as e:
                     print(f"[ERROR] Inference error: {e}")
 
-            # Pace inference (~15–20 runs per second to balance CPU/thermal load)
-            time.sleep(0.05)
+            # Pace inference to ~1.5 FPS (650ms cycle) for thermal stability and high accuracy
+            time.sleep(0.65)
 
     def get_latest_frame(self) -> Tuple[bool, Optional[any]]:
         """Returns the most recent raw OpenCV BGR frame (clean, unadorned)."""

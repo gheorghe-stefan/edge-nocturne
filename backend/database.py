@@ -90,6 +90,45 @@ def init_db():
     conn.close()
 
 
+def get_or_create_auto_entity(category: str, embedding: Optional[Any] = None) -> int:
+    """Creates a new sequential auto-named entity (e.g. 'Car 1', 'Animal 1', 'Person 1') when a novel subject appears."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    prefix_map = {
+        "vehicle": "Car",
+        "animal": "Animal",
+        "person": "Person",
+    }
+    prefix = prefix_map.get(category, "Subject")
+
+    cursor.execute("SELECT name FROM entities WHERE name LIKE ?", (f"{prefix} %",))
+    rows = cursor.fetchall()
+    existing_nums = []
+    for r in rows:
+        name = r["name"]
+        parts = name.split()
+        if len(parts) >= 2 and parts[1].isdigit():
+            existing_nums.append(int(parts[1]))
+
+    next_num = max(existing_nums, default=0) + 1
+    new_name = f"{prefix} {next_num}"
+    emb_str = json.dumps(embedding) if embedding else None
+
+    cursor.execute(
+        """
+        INSERT INTO entities (name, category, total_sightings, embedding_json)
+        VALUES (?, ?, 0, ?)
+        """,
+        (new_name, category, emb_str),
+    )
+    new_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    print(f"[ENTITY] Auto-provisioned new group '{new_name}' (ID {new_id}) for {category}")
+    return new_id
+
+
 def log_sighting(
     label: str,
     category: str,
@@ -99,10 +138,15 @@ def log_sighting(
     metadata: Optional[Dict[str, Any]] = None,
     embedding: Optional[List[float]] = None,
     entity_id: Optional[int] = None,
+    auto_create: bool = True,
 ) -> int:
     """Logs a new detection sighting with snapshot, clip, embedding, and optional entity reference."""
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    # Automatically create a new group if novel subject has an embedding
+    if not entity_id and auto_create and embedding:
+        entity_id = get_or_create_auto_entity(category, embedding)
 
     meta_str = json.dumps(metadata) if metadata else None
     emb_str = json.dumps(embedding) if embedding else None
@@ -116,7 +160,7 @@ def log_sighting(
     )
     sighting_id = cursor.lastrowid
 
-    # If linked to an existing entity, update last seen and sighting count
+    # If linked to an existing entity, update last seen, sighting count, and merge centroid embedding
     if entity_id:
         cursor.execute(
             """
@@ -126,6 +170,20 @@ def log_sighting(
             """,
             (entity_id,),
         )
+        if embedding:
+            cursor.execute("SELECT total_sightings, embedding_json FROM entities WHERE id = ?", (entity_id,))
+            ent_row = cursor.fetchone()
+            if ent_row and ent_row["embedding_json"]:
+                try:
+                    cur_count = ent_row["total_sightings"]
+                    cur_emb = json.loads(ent_row["embedding_json"])
+                    merged_emb = fingerprint_engine.merge_embeddings(cur_emb, embedding, cur_count)
+                    cursor.execute(
+                        "UPDATE entities SET embedding_json = ? WHERE id = ?",
+                        (json.dumps(merged_emb), entity_id),
+                    )
+                except Exception:
+                    pass
 
     conn.commit()
     conn.close()
@@ -154,7 +212,17 @@ def get_recent_sightings(limit: int = 50, category: Optional[str] = None) -> Lis
 
     cursor.execute(query, tuple(params))
     rows = cursor.fetchall()
-    results = [dict(r) for r in rows]
+    results = []
+    for r in rows:
+        d = dict(r)
+        if d.get("metadata_json"):
+            try:
+                d["metadata"] = json.loads(d["metadata_json"])
+            except Exception:
+                d["metadata"] = {}
+        else:
+            d["metadata"] = {}
+        results.append(d)
     conn.close()
     return results
 
@@ -737,12 +805,23 @@ def get_grouped_entities() -> Dict[str, Any]:
 
     for ent in entities:
         cursor.execute("""
-            SELECT id, timestamp, label, confidence, snapshot_filename, clip_filename
+            SELECT id, timestamp, label, confidence, snapshot_filename, clip_filename, metadata_json
             FROM sightings
             WHERE entity_id = ?
             ORDER BY timestamp DESC
         """, (ent["id"],))
-        ent["sightings"] = [dict(s) for s in cursor.fetchall()]
+        s_rows = []
+        for s in cursor.fetchall():
+            sd = dict(s)
+            if sd.get("metadata_json"):
+                try:
+                    sd["metadata"] = json.loads(sd["metadata_json"])
+                except Exception:
+                    sd["metadata"] = {}
+            else:
+                sd["metadata"] = {}
+            s_rows.append(sd)
+        ent["sightings"] = s_rows
 
     cursor.execute("""
         SELECT id, timestamp, label, category, confidence, snapshot_filename, clip_filename

@@ -791,7 +791,7 @@ HTML_TEMPLATE = """
                     document.getElementById('temp-badge').innerText = 'CPU: ' + data.cpu_temp;
                 }
                 if (data.inference_ms !== undefined) {
-                    document.getElementById('latency-badge').innerText = '⚡ LiteRT: ' + data.inference_ms + ' ms';
+                    document.getElementById('latency-badge').innerText = '⚡ ML: ' + data.inference_ms + ' ms';
                 }
                 if (data.storage && data.storage.free_percent !== undefined) {
                     document.getElementById('storage-badge').innerText = '💾 Disk: ' + data.storage.free_percent + '% Free';
@@ -900,6 +900,7 @@ HTML_TEMPLATE = """
                                                 ${s.clip_filename ? `<button class="btn btn-sm" style="padding: 0.2rem 0.5rem;" onclick="playClip('${s.clip_filename}', '${ent.name} - ${s.timestamp}')">▶ Play</button>` : ''}
                                                 <a class="btn btn-sm" style="padding: 0.2rem 0.5rem;" href="/api/media/snapshots/${s.snapshot_filename}" target="_blank">📸</a>
                                             </div>
+                                            ${s.metadata && s.metadata.server_summary ? `<div style="font-size: 0.72rem; color: var(--accent-cyan); margin-top: 0.3rem; background: rgba(0,255,200,0.06); padding: 0.25rem 0.4rem; border-radius: 4px; border: 1px solid rgba(0,255,200,0.15); line-height: 1.2;">🤖 <em>${s.metadata.server_summary}</em></div>` : ''}
                                         </div>
                                     `).join('')}
                                 </div>
@@ -985,6 +986,7 @@ HTML_TEMPLATE = """
                             </div>
                             <div class="sighting-time">📅 ${s.timestamp}</div>
                             ${s.entity_name ? `<div class="entity-pill">🏷️ ${s.entity_name}</div>` : ''}
+                            ${s.metadata && s.metadata.server_summary ? `<div style="font-size: 0.78rem; color: var(--accent-cyan); margin-top: 0.35rem; background: rgba(0,255,200,0.06); padding: 0.35rem 0.5rem; border-radius: 4px; border: 1px solid rgba(0,255,200,0.18); line-height: 1.3;">🤖 <em>${s.metadata.server_summary}</em></div>` : ''}
                             
                             <div class="sighting-actions">
                                 ${s.clip_filename ? `<button class="btn btn-sm" onclick="playClip('${s.clip_filename}', '${s.label} - ${s.timestamp}')">▶ Play Clip</button>` : ''}

@@ -18,6 +18,7 @@ from backend.database import (
     log_sighting,
 )
 from backend.fingerprint import fingerprint_engine
+from backend.server_check import dispatch_server_check
 
 
 class VideoRecorder:
@@ -83,7 +84,7 @@ class VideoRecorder:
                 pass  # Drop frame instead of stuttering camera capture loop
 
     def trigger_event(self, detections: List[Dict[str, Any]]) -> bool:
-        """Triggers an event-clip recording if cooldown has passed and target is detected."""
+        """Triggers an event-clip recording if cooldown has passed and targets are detected."""
         now = time.time()
         if self.is_recording_event or (now - self.last_event_time < self.event_cooldown):
             return False
@@ -91,44 +92,27 @@ class VideoRecorder:
         if not detections:
             return False
 
-        # Sort by confidence to find the best detection
-        best_det = max(detections, key=lambda d: d.get("confidence", 0.0))
-        if best_det.get("confidence", 0.0) < 0.60:
+        # Filter valid targets (person, vehicle, animal) with confidence >= 0.35
+        valid_targets = [
+            d for d in detections
+            if d.get("category") in ("person", "vehicle", "animal") and d.get("confidence", 0.0) >= 0.35
+        ]
+        if not valid_targets:
             return False
-
-        # Motion verification gate: Reject static inanimate fixtures (e.g. ceiling lamps, furniture)
-        with self.buffer_lock:
-            if len(self.frame_buffer) >= 20:
-                cur_f = self.frame_buffer[-1]
-                old_f = self.frame_buffer[0]
-                box = best_det.get("box")
-                if box and len(box) == 4:
-                    h, w = cur_f.shape[:2]
-                    y1 = max(0, int(box[0] * h))
-                    x1 = max(0, int(box[1] * w))
-                    y2 = min(h, int(box[2] * h))
-                    x2 = min(w, int(box[3] * w))
-                    if y2 > y1 + 15 and x2 > x1 + 15:
-                        cur_crop = cur_f[y1:y2, x1:x2]
-                        old_crop = old_f[y1:y2, x1:x2]
-                        diff = cv2.absdiff(cur_crop, old_crop)
-                        mean_diff = float(np.mean(diff))
-                        if mean_diff < 3.5:
-                            return False  # Static scene artifact, ignore
 
         self.is_recording_event = True
         self.last_event_time = now
 
-        # Launch asynchronous clip recording thread
+        # Launch asynchronous clip recording thread with ALL active target detections
         threading.Thread(
             target=self._record_event_worker,
-            args=(best_det,),
+            args=(valid_targets,),
             daemon=True,
         ).start()
         return True
 
-    def _record_event_worker(self, best_det: Dict[str, Any]):
-        """Records the pre-roll frames + subsequent frames into an MP4 clip."""
+    def _record_event_worker(self, targets: List[Dict[str, Any]]):
+        """Records pre-roll + event clip, extracts embeddings for all targets, and logs sightings."""
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         clip_filename = f"event_{timestamp_str}.mp4"
         snap_filename = f"snap_{timestamp_str}.jpg"
@@ -142,6 +126,7 @@ class VideoRecorder:
             pre_roll_frames = list(self.frame_buffer)
 
         # 2. Save best 1080p snapshot
+        best_frame = None
         if pre_roll_frames:
             best_frame = pre_roll_frames[-1]
             cv2.imwrite(snap_path, best_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
@@ -190,36 +175,44 @@ class VideoRecorder:
 
         self.is_recording_event = False
 
-        # 4. Extract Tier 2 visual embedding and check for existing entity match
-        embedding = None
-        matched_entity_id = None
-        if pre_roll_frames and best_frame is not None:
-            try:
-                embedding = fingerprint_engine.extract_embedding(
-                    best_frame, best_det.get("box"), category=best_det.get("category", "other")
-                )
-                matched_entity_id, matched_name, sim = find_matching_entity(
-                    embedding, category=best_det.get("category", "other"), min_similarity=0.88, min_margin=0.03
-                )
-                if matched_entity_id:
-                    print(
-                        f"[RE-ID] Auto-matched sighting to '{matched_name}' (confidence: {sim:.2f})"
+        # 4. Extract visual embeddings and log sightings for ALL targets simultaneously
+        sighting_ids = []
+        for det in targets:
+            embedding = None
+            matched_entity_id = None
+            category = det.get("category", "other")
+            if pre_roll_frames and best_frame is not None:
+                try:
+                    embedding = fingerprint_engine.extract_embedding(
+                        best_frame, det.get("box"), category=category
                     )
-            except Exception as e:
-                print(f"[WARN] Error extracting embedding: {e}")
+                    matched_entity_id, matched_name, sim = find_matching_entity(
+                        embedding, category=category, min_similarity=0.86, min_margin=0.03
+                    )
+                    if matched_entity_id:
+                        print(
+                            f"[RE-ID] Auto-matched sighting to '{matched_name}' (confidence: {sim:.2f})"
+                        )
+                except Exception as e:
+                    print(f"[WARN] Error extracting embedding: {e}")
 
-        # 5. Log sighting to SQLite database
-        log_sighting(
-            label=best_det.get("label", "unknown"),
-            category=best_det.get("category", "other"),
-            confidence=best_det.get("confidence", 0.0),
-            snapshot_filename=snap_filename,
-            clip_filename=clip_filename,
-            metadata={"box": best_det.get("box"), "resolution": f"{self.width}x{self.height}"},
-            embedding=embedding,
-            entity_id=matched_entity_id,
-        )
-        print(f"[RECORDER] Sighting recorded: {best_det.get('label')} -> {clip_filename}")
+            # 5. Log sighting to SQLite database (auto-creates group if novel)
+            s_id = log_sighting(
+                label=det.get("label", "unknown"),
+                category=category,
+                confidence=det.get("confidence", 0.0),
+                snapshot_filename=snap_filename,
+                clip_filename=clip_filename,
+                metadata={"box": det.get("box"), "resolution": f"{self.width}x{self.height}"},
+                embedding=embedding,
+                entity_id=matched_entity_id,
+            )
+            sighting_ids.append(s_id)
+            print(f"[RECORDER] Sighting #{s_id} logged: {det.get('label')} -> {clip_filename}")
+
+        # 6. Dispatch optional async verification to self-hosted server (non-blocking)
+        if sighting_ids and os.path.exists(snap_path):
+            dispatch_server_check(snap_path, sighting_ids, targets)
 
     def _dvr_worker(self):
         """Dedicated background worker that writes DVR chunks safely without touching capture loop."""
