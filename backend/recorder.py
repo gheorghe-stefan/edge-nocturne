@@ -178,25 +178,30 @@ class VideoRecorder:
         # 4. Extract visual embeddings and log sightings for ALL targets simultaneously
         sighting_ids = []
         for det in targets:
-            embedding = None
-            matched_entity_id = None
             category = det.get("category", "other")
-            if pre_roll_frames and best_frame is not None:
-                try:
-                    embedding = fingerprint_engine.extract_embedding(
-                        best_frame, det.get("box"), category=category
-                    )
-                    matched_entity_id, matched_name, sim = find_matching_entity(
-                        embedding, category=category, min_similarity=0.86, min_margin=0.03
-                    )
-                    if matched_entity_id:
-                        print(
-                            f"[RE-ID] Auto-matched sighting to '{matched_name}' (confidence: {sim:.2f})"
-                        )
-                except Exception as e:
-                    print(f"[WARN] Error extracting embedding: {e}")
+            matched_entity_id = det.get("entity_id")
+            embedding = det.get("embedding")
 
-            # 5. Log sighting to SQLite database (auto-creates group if novel)
+            if matched_entity_id:
+                print(f"[RECORDER] Reusing track-locked identity for sighting: '{det.get('entity_name')}' (ID {matched_entity_id})")
+            else:
+                if pre_roll_frames and best_frame is not None:
+                    try:
+                        if not embedding:
+                            embedding = fingerprint_engine.extract_embedding(
+                                best_frame, det.get("box"), category=category
+                            )
+                        matched_entity_id, matched_name, sim = find_matching_entity(
+                            embedding, category=category
+                        )
+                        if matched_entity_id:
+                            print(
+                                f"[RE-ID] Auto-matched sighting to '{matched_name}' (confidence: {sim:.2f})"
+                            )
+                    except Exception as e:
+                        print(f"[WARN] Error extracting embedding: {e}")
+
+            # 5. Log sighting to SQLite database
             s_id = log_sighting(
                 label=det.get("label", "unknown"),
                 category=category,

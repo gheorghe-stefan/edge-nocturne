@@ -26,8 +26,17 @@ def compute_iou(boxA: List[float], boxB: List[float]) -> float:
     return inter_area / union_area
 
 
+def compute_center_distance(boxA: List[float], boxB: List[float]) -> float:
+    """Computes normalized Euclidean distance between box centers (0.0 to 1.414)."""
+    cA_x = (boxA[1] + boxA[3]) / 2.0
+    cA_y = (boxA[0] + boxA[2]) / 2.0
+    cB_x = (boxB[1] + boxB[3]) / 2.0
+    cB_y = (boxB[0] + boxB[2]) / 2.0
+    return float(np.sqrt((cA_x - cB_x) ** 2 + (cA_y - cB_y) ** 2))
+
+
 class Tracklet:
-    """Represents a single tracked physical subject over time."""
+    """Represents a continuous physical subject tracked across frames with identity locking."""
 
     def __init__(self, track_id: int, detection: Dict[str, Any]):
         self.track_id = track_id
@@ -41,7 +50,13 @@ class Tracklet:
         self.first_seen = time.time()
         self.last_seen = self.first_seen
 
-        # Track trajectory for motion persistence verification
+        # Persistent identity lock (e.g. Stefan or Monica once identified)
+        self.entity_id: Optional[int] = None
+        self.entity_name: Optional[str] = None
+        self.has_face: bool = False
+        self.best_embedding: Optional[Dict[str, Any]] = None
+
+        # Trajectory history for movement verification
         cx = (self.box[1] + self.box[3]) / 2.0
         cy = (self.box[0] + self.box[2]) / 2.0
         self.positions: List[Tuple[float, float]] = [(cx, cy)]
@@ -58,78 +73,95 @@ class Tracklet:
         cx = (self.box[1] + self.box[3]) / 2.0
         cy = (self.box[0] + self.box[2]) / 2.0
         self.positions.append((cx, cy))
-        if len(self.positions) > 10:
+        if len(self.positions) > 15:
             self.positions.pop(0)
 
-        # Check total displacement across tracklet history
+        # 1.5% displacement across history or persistent active presence confirms physical subject
         if len(self.positions) >= 2:
             init_x, init_y = self.positions[0]
             dist = np.sqrt((cx - init_x) ** 2 + (cy - init_y) ** 2)
-            # 2% displacement across frame confirms genuine physical motion
-            if dist > 0.02 or self.hits >= 4:
+            if dist > 0.015 or self.hits >= 3:
                 self.has_moved = True
+
+    def lock_identity(self, entity_id: int, entity_name: str, embedding: Optional[Dict[str, Any]] = None, has_face: bool = False):
+        """Locks this track to a known identity. Once locked, the identity persists across all movements."""
+        self.entity_id = entity_id
+        self.entity_name = entity_name
+        if embedding:
+            self.best_embedding = embedding
+        if has_face:
+            self.has_face = True
 
     def mark_missed(self):
         self.time_since_update += 1
 
 
 class MultiObjectTracker:
-    """Lightweight online tracker maintaining track IDs and motion persistence across ticks."""
+    """Online spatial-temporal tracker linking detections by IoU and center proximity across ticks."""
 
     def __init__(
         self,
-        min_iou: float = 0.25,
-        max_age: int = 3,
+        min_iou: float = 0.15,
+        max_center_distance: float = 0.25,
+        max_age: int = 15,  # Keep track alive for 15 seconds across pauses or turns
         min_hits_for_active: int = 2,
     ):
         self.min_iou = min_iou
+        self.max_center_distance = max_center_distance
         self.max_age = max_age
         self.min_hits_for_active = min_hits_for_active
         self.tracks: List[Tracklet] = []
         self._next_id = 1
 
     def update(self, detections: List[Dict[str, Any]]) -> List[Tracklet]:
-        """Updates tracks with new detections and returns list of confirmed active moving tracks."""
-        # 1. Match new detections to existing tracks via IoU
+        """Updates tracks with new detections via IoU + proximity, preserving locked identities."""
         unmatched_dets = list(range(len(detections)))
         matched_tracks = set()
 
         if self.tracks and detections:
-            iou_matrix = np.zeros((len(self.tracks), len(detections)), dtype=np.float32)
+            # Build match score matrix: prefers IoU, falls back to center proximity
+            scores = np.zeros((len(self.tracks), len(detections)), dtype=np.float32)
             for t_idx, track in enumerate(self.tracks):
                 for d_idx, det in enumerate(detections):
-                    # Same category preference
                     if track.category == det.get("category"):
-                        iou_matrix[t_idx, d_idx] = compute_iou(track.box, det.get("box", [0, 0, 0, 0]))
+                        d_box = det.get("box", [0, 0, 0, 0])
+                        iou = compute_iou(track.box, d_box)
+                        c_dist = compute_center_distance(track.box, d_box)
+
+                        if iou >= self.min_iou:
+                            scores[t_idx, d_idx] = 1.0 + iou
+                        elif c_dist <= self.max_center_distance:
+                            # Proximity match (e.g. person bent over or turned, changing aspect ratio)
+                            scores[t_idx, d_idx] = 1.0 - c_dist
 
             # Greedy assignment
             while True:
-                max_val = np.max(iou_matrix)
-                if max_val < self.min_iou:
+                max_val = float(np.max(scores))
+                if max_val <= 0.0:
                     break
-                t_idx, d_idx = np.unravel_index(np.argmax(iou_matrix), iou_matrix.shape)
+                t_idx, d_idx = np.unravel_index(np.argmax(scores), scores.shape)
                 self.tracks[t_idx].update(detections[d_idx])
                 matched_tracks.add(t_idx)
                 if d_idx in unmatched_dets:
                     unmatched_dets.remove(d_idx)
-                iou_matrix[t_idx, :] = -1.0
-                iou_matrix[:, d_idx] = -1.0
+                scores[t_idx, :] = -1.0
+                scores[:, d_idx] = -1.0
 
-        # 2. Mark missed tracks
+        # Mark missed tracks
         for t_idx, track in enumerate(self.tracks):
             if t_idx not in matched_tracks:
                 track.mark_missed()
 
-        # 3. Create new tracks for unmatched detections
+        # Create new tracks for unmatched detections
         for d_idx in unmatched_dets:
             new_track = Tracklet(self._next_id, detections[d_idx])
             self._next_id += 1
             self.tracks.append(new_track)
 
-        # 4. Prune dead tracks
+        # Prune dead tracks (retained for up to max_age seconds)
         self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
 
-        # 5. Return confirmed active tracks (observed for >= min_hits and verified moved)
+        # Return confirmed active tracks (observed for >= min_hits and verified moved)
         active_confirmed = [
             t for t in self.tracks
             if t.hits >= self.min_hits_for_active and t.time_since_update == 0 and t.has_moved

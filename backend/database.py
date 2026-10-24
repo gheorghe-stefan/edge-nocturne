@@ -138,15 +138,10 @@ def log_sighting(
     metadata: Optional[Dict[str, Any]] = None,
     embedding: Optional[List[float]] = None,
     entity_id: Optional[int] = None,
-    auto_create: bool = True,
 ) -> int:
     """Logs a new detection sighting with snapshot, clip, embedding, and optional entity reference."""
     conn = get_db_connection()
     cursor = conn.cursor()
-
-    # Automatically create a new group if novel subject has an embedding
-    if not entity_id and auto_create and embedding:
-        entity_id = get_or_create_auto_entity(category, embedding)
 
     meta_str = json.dumps(metadata) if metadata else None
     emb_str = json.dumps(embedding) if embedding else None
@@ -228,16 +223,23 @@ def get_recent_sightings(limit: int = 50, category: Optional[str] = None) -> Lis
 
 
 def find_matching_entity(
-    embedding: List[float],
+    embedding: Any,
     category: str,
-    min_similarity: float = 0.88,
+    min_similarity: Optional[float] = None,
     min_margin: float = 0.03,
 ) -> Tuple[Optional[int], Optional[str], float]:
     """Finds best matching known entity using cosine similarity against stored embeddings.
-    Requires meeting minimum similarity threshold and a decisive separation margin against other entities.
+    Uses high-precision threshold (0.85) when face is visible, and appearance threshold (0.72) for body matching.
     """
     if not embedding:
         return None, None, 0.0
+
+    has_face = False
+    if isinstance(embedding, dict) and embedding.get("face") is not None:
+        has_face = True
+
+    if min_similarity is None:
+        min_similarity = 0.85 if has_face else 0.72
 
     conn = get_db_connection()
     cursor = conn.cursor()

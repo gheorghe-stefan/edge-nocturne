@@ -5,6 +5,8 @@ from typing import List, Optional, Tuple
 from backend.detector import ObjectDetector
 from backend.recorder import VideoRecorder
 from backend.tracker import MultiObjectTracker
+from backend.fingerprint import fingerprint_engine
+from backend.database import find_matching_entity
 
 
 class VideoCamera:
@@ -171,6 +173,21 @@ class VideoCamera:
                     # Update online multi-object tracker
                     active_tracks = self.tracker.update(detections)
 
+                    # In-flight identity locking: check face/appearance while subject is moving
+                    for t in active_tracks:
+                        if not t.has_face:
+                            try:
+                                emb = fingerprint_engine.extract_embedding(frame, t.box, category=t.category)
+                                if emb:
+                                    m_id, m_name, sim = find_matching_entity(emb, category=t.category)
+                                    if m_id:
+                                        t.lock_identity(m_id, m_name, embedding=emb, has_face=(emb.get("face") is not None))
+                                        print(f"[TRACKER] Locked Track #{t.track_id} -> '{m_name}' (conf: {sim:.2f})")
+                                    elif t.best_embedding is None:
+                                        t.best_embedding = emb
+                            except Exception:
+                                pass
+
                     # Trigger event recording if verified active moving targets exist
                     if active_tracks:
                         active_dets = [
@@ -180,6 +197,9 @@ class VideoCamera:
                                 "confidence": t.confidence,
                                 "box": t.box,
                                 "track_id": t.track_id,
+                                "entity_id": t.entity_id,
+                                "entity_name": t.entity_name,
+                                "embedding": t.best_embedding,
                             }
                             for t in active_tracks
                         ]
