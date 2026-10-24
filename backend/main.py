@@ -44,6 +44,10 @@ class ContinuousSettingRequest(BaseModel):
     enabled: bool
 
 
+class CaptureSettingRequest(BaseModel):
+    enabled: bool
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global camera
@@ -116,18 +120,21 @@ def get_system_stats():
     inference_ms = 0.0
     is_dvr_active = False
     is_recording_event = False
+    is_capture_active = True
 
     if camera:
         detections, inference_ms = camera.get_latest_detections()
         is_dvr_active = camera.is_continuous_recording()
         is_recording_event = camera.recorder.is_recording_event
+        is_capture_active = camera.is_capture_active
 
     return {
-        "status": "online",
+        "status": "online" if is_capture_active else "paused",
+        "is_capture_active": is_capture_active,
         "version": __version__,
         "cpu_temp": temp_str,
         "resolution": f"{camera.width}x{camera.height}" if camera else "offline",
-        "fps": camera.fps if camera else 0,
+        "fps": camera.fps if (camera and is_capture_active) else 0,
         "inference_ms": inference_ms,
         "detections": detections,
         "storage": get_storage_stats(),
@@ -205,6 +212,15 @@ def toggle_continuous_loop(req: ContinuousSettingRequest):
         raise HTTPException(status_code=503, detail="Camera not initialized")
     camera.set_continuous_recording(req.enabled)
     return {"status": "ok", "continuous_recording": req.enabled}
+
+
+@app.post("/api/settings/capture")
+def toggle_camera_capture(req: CaptureSettingRequest):
+    """Starts or stops live camera capture, streaming, and ML inference."""
+    if not camera:
+        raise HTTPException(status_code=503, detail="Camera not initialized")
+    camera.set_capture_active(req.enabled)
+    return {"status": "ok", "is_capture_active": req.enabled}
 
 
 @app.get("/api/media/clips/{filename}")
@@ -635,9 +651,10 @@ HTML_TEMPLATE = """
         </div>
         <div class="meta-badges">
             <button class="btn btn-sm" onclick="openTailscaleModal()" style="padding: 0.2rem 0.6rem; font-size: 0.8rem;">🌐 Remote Access</button>
+            <div class="badge" id="capture-badge" style="font-weight: 600; color: var(--status-green);">📹 Capture: Active</div>
             <div class="badge badge-detection" id="detection-badge">🟢 Scene Clear</div>
             <div class="badge" id="storage-badge">💾 Disk: --% Free</div>
-            <div class="badge" id="latency-badge">⚡ LiteRT: -- ms</div>
+            <div class="badge" id="latency-badge">⚡ ML: -- ms</div>
             <div class="badge" id="temp-badge">CPU: --°C</div>
             <div class="badge" id="version-badge" style="font-family: monospace; color: var(--accent-cyan); font-weight: 600;">v{{VERSION}}</div>
         </div>
@@ -660,14 +677,20 @@ HTML_TEMPLATE = """
                 </div>
             </div>
             <div class="controls-row">
-                <div class="dvr-toggle-box">
-                    <label class="switch">
-                        <input type="checkbox" id="dvr-toggle" onchange="toggleContinuousDVR(this.checked)">
-                        <span class="slider"></span>
-                    </label>
-                    <div>
-                        <div style="font-size: 0.9rem; font-weight: 600;">Continuous DVR Loop</div>
-                        <div style="font-size: 0.75rem; color: var(--text-muted);">Keep last 24h • 15% Min Free Guard</div>
+                <div style="display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap;">
+                    <button id="btn-toggle-capture" class="btn" onclick="toggleCameraCapture()" style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #fca5a5; font-weight: 600; display: flex; align-items: center; gap: 0.5rem; padding: 0.55rem 1rem;">
+                        <span id="capture-icon">⏸️</span>
+                        <span id="capture-text">Stop Capture</span>
+                    </button>
+                    <div class="dvr-toggle-box">
+                        <label class="switch">
+                            <input type="checkbox" id="dvr-toggle" onchange="toggleContinuousDVR(this.checked)">
+                            <span class="slider"></span>
+                        </label>
+                        <div>
+                            <div style="font-size: 0.9rem; font-weight: 600;">Continuous DVR Loop</div>
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">Keep last 24h • 15% Min Free Guard</div>
+                        </div>
                     </div>
                 </div>
                 <div class="res-bar">
@@ -776,6 +799,8 @@ HTML_TEMPLATE = """
             }
         }
 
+        let isCaptureActive = true;
+
         async function updateStats() {
             try {
                 const res = await fetch('/api/stats');
@@ -785,7 +810,11 @@ HTML_TEMPLATE = """
                     document.getElementById('version-badge').innerText = 'v' + data.version;
                 }
                 if (data.resolution && document.getElementById('hud-res')) {
-                    document.getElementById('hud-res').innerText = 'FEED: ' + data.resolution + ' @ ' + (data.fps || 30) + ' FPS';
+                    if (data.is_capture_active === false) {
+                        document.getElementById('hud-res').innerText = 'FEED: PAUSED (Standby Mode)';
+                    } else {
+                        document.getElementById('hud-res').innerText = 'FEED: ' + data.resolution + ' @ ' + (data.fps || 30) + ' FPS';
+                    }
                 }
                 if (data.cpu_temp) {
                     document.getElementById('temp-badge').innerText = 'CPU: ' + data.cpu_temp;
@@ -800,11 +829,52 @@ HTML_TEMPLATE = """
                     document.getElementById('dvr-toggle').checked = data.continuous_recording;
                 }
 
+                // Capture Active State Handler
+                if (data.is_capture_active !== undefined) {
+                    isCaptureActive = data.is_capture_active;
+                    const btn = document.getElementById('btn-toggle-capture');
+                    const icon = document.getElementById('capture-icon');
+                    const text = document.getElementById('capture-text');
+                    const badge = document.getElementById('capture-badge');
+                    
+                    if (isCaptureActive) {
+                        if (btn) {
+                            btn.style.background = 'rgba(239, 68, 68, 0.15)';
+                            btn.style.borderColor = 'rgba(239, 68, 68, 0.4)';
+                            btn.style.color = '#fca5a5';
+                        }
+                        if (icon) icon.innerText = '⏸️';
+                        if (text) text.innerText = 'Stop Capture';
+                        if (badge) {
+                            badge.innerText = '📹 Capture: Active';
+                            badge.style.color = 'var(--status-green)';
+                            badge.style.borderColor = 'var(--border-color)';
+                        }
+                    } else {
+                        if (btn) {
+                            btn.style.background = 'rgba(16, 185, 129, 0.2)';
+                            btn.style.borderColor = 'rgba(16, 185, 129, 0.5)';
+                            btn.style.color = '#6ee7b7';
+                        }
+                        if (icon) icon.innerText = '▶️';
+                        if (text) text.innerText = 'Start Capture';
+                        if (badge) {
+                            badge.innerText = '⏸️ Capture: Paused';
+                            badge.style.color = '#fca5a5';
+                            badge.style.borderColor = 'rgba(239, 68, 68, 0.4)';
+                        }
+                    }
+                }
+
                 // Live Detections
                 const detBadge = document.getElementById('detection-badge');
                 const bannerText = document.getElementById('banner-text');
 
-                if (data.detections && data.detections.length > 0) {
+                if (!isCaptureActive) {
+                    detBadge.innerText = '⏸️ Scanner Idle';
+                    detBadge.classList.remove('detected');
+                    bannerText.innerHTML = '<span style="color: #fca5a5;">⏸️ Live Camera Ingestion Paused</span>';
+                } else if (data.detections && data.detections.length > 0) {
                     const topItems = data.detections.map(d => `${d.label} (${Math.round(d.confidence * 100)}%)`).join(', ');
                     detBadge.innerText = '🎯 Detected: ' + topItems;
                     detBadge.classList.add('detected');
@@ -818,6 +888,32 @@ HTML_TEMPLATE = """
         }
         setInterval(updateStats, 1000);
         updateStats();
+
+        async function toggleCameraCapture() {
+            const btn = document.getElementById('btn-toggle-capture');
+            const targetState = !isCaptureActive;
+            if (btn) btn.disabled = true;
+            try {
+                const res = await fetch('/api/settings/capture', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ enabled: targetState })
+                });
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    isCaptureActive = data.is_capture_active;
+                    const feed = document.querySelector('.video-feed');
+                    if (feed) {
+                        feed.src = '/api/stream?res=' + currentResolution + '&t=' + Date.now();
+                    }
+                    updateStats();
+                }
+            } catch(e) {
+                alert('Failed to toggle camera capture: ' + e);
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        }
 
         async function toggleContinuousDVR(enabled) {
             try {

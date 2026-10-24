@@ -53,9 +53,11 @@ class VideoCamera:
         self.frame_lock = threading.Lock()
         self.ml_lock = threading.Lock()
         self.stopped = False
+        self.is_capture_active = True
 
         self.latest_detections: List[dict] = []
         self.inference_ms: float = 0.0
+        self.standby_frame = self._create_standby_frame(self.width, self.height)
 
         if not self.grabbed:
             print(f"[WARN] Failed to read initial frame from camera device {self.device_id}")
@@ -79,6 +81,38 @@ class VideoCamera:
                 self.detector = None
 
     @staticmethod
+    def _create_standby_frame(width: int = 1920, height: int = 1080) -> any:
+        """Generates a professional dark standby frame when live capture is paused."""
+        import numpy as np
+        img = np.zeros((height, width, 3), dtype=np.uint8)
+        img[:] = (26, 17, 10)  # Dark midnight slate (#0a111a)
+
+        # Ambient inner frame border
+        cv2.rectangle(img, (24, 24), (width - 24, height - 24), (55, 42, 28), 2)
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        title = "LIVE CAMERA CAPTURE PAUSED"
+        sub1 = "Video stream ingestion and AI object detection are temporarily suspended."
+        sub2 = "Click 'Start Capture' in the dashboard controls to resume."
+
+        # Centered Title
+        t_size = cv2.getTextSize(title, font, 1.3, 3)[0]
+        t_x = (width - t_size[0]) // 2
+        t_y = height // 2 - 40
+        cv2.putText(img, title, (t_x, t_y), font, 1.3, (245, 245, 245), 3, cv2.LINE_AA)
+
+        # Subtitle lines
+        s1_size = cv2.getTextSize(sub1, font, 0.85, 2)[0]
+        s1_x = (width - s1_size[0]) // 2
+        cv2.putText(img, sub1, (s1_x, t_y + 55), font, 0.85, (170, 185, 200), 2, cv2.LINE_AA)
+
+        s2_size = cv2.getTextSize(sub2, font, 0.85, 2)[0]
+        s2_x = (width - s2_size[0]) // 2
+        cv2.putText(img, sub2, (s2_x, t_y + 105), font, 0.85, (0, 235, 255), 2, cv2.LINE_AA)
+
+        return img
+
+    @staticmethod
     def _find_camera_device() -> int:
         for idx in range(10):
             try:
@@ -97,6 +131,15 @@ class VideoCamera:
     def _capture_loop(self):
         """Dedicated thread to constantly drain camera buffer at full frame rate."""
         while not self.stopped:
+            if not self.is_capture_active:
+                # Flush underlying V4L2 device buffer slowly without burning CPU
+                try:
+                    self.cap.grab()
+                except Exception:
+                    pass
+                time.sleep(0.08)
+                continue
+
             try:
                 grabbed, frame = self.cap.read()
                 if grabbed and frame is not None:
@@ -113,7 +156,7 @@ class VideoCamera:
     def _inference_loop(self):
         """Asynchronous ML worker running high-accuracy inference (~1.5 FPS) with online multi-object tracking."""
         while not self.stopped:
-            if not self.detector:
+            if not self.detector or not self.is_capture_active:
                 time.sleep(0.5)
                 continue
 
@@ -150,11 +193,24 @@ class VideoCamera:
             time.sleep(sleep_interval)
 
     def get_latest_frame(self) -> Tuple[bool, Optional[any]]:
-        """Returns the most recent raw OpenCV BGR frame (clean, unadorned)."""
+        """Returns the most recent raw OpenCV BGR frame (or standby frame if paused)."""
+        if not self.is_capture_active:
+            return True, self.standby_frame.copy()
+
         with self.frame_lock:
             if not self.grabbed or self.frame is None:
                 return False, None
             return True, self.frame.copy()
+
+    def set_capture_active(self, active: bool):
+        """Starts or pauses live camera capture, streaming, and ML inference."""
+        with self.frame_lock:
+            self.is_capture_active = active
+        with self.ml_lock:
+            if not active:
+                self.latest_detections = []
+                self.inference_ms = 0.0
+        print(f"[CAMERA] Live capture state changed: is_capture_active={active}")
 
     def get_latest_detections(self) -> Tuple[List[dict], float]:
         """Returns current detections and inference latency in ms."""
