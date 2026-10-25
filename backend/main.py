@@ -170,7 +170,11 @@ def get_camera_snapshot(camera_id: int, res: Optional[str] = None):
     frame_bytes = cam.get_jpeg_bytes(quality=quality, resolution=res)
     if not frame_bytes:
         return Response(status_code=500, content="Failed to capture frame")
-    return Response(content=frame_bytes, media_type="image/jpeg")
+    return Response(
+        content=frame_bytes,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"},
+    )
 
 
 @app.get("/api/stream")
@@ -874,8 +878,8 @@ HTML_TEMPLATE = """
                 <div style="display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap;">
                     <div class="res-bar" id="matrix-mode-bar">
                         <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 600;">Matrix:</span>
-                        <button class="res-btn active" id="btn-matrix-live" onclick="setMatrixStreamMode('live')">⚡ Live Stream</button>
-                        <button class="res-btn" id="btn-matrix-eco" onclick="setMatrixStreamMode('eco')">📷 Eco Refresh</button>
+                        <button class="res-btn" id="btn-matrix-live" onclick="setMatrixStreamMode('live')">⚡ Live Stream</button>
+                        <button class="res-btn active" id="btn-matrix-eco" onclick="setMatrixStreamMode('eco')">📷 Eco Refresh</button>
                     </div>
                     <button class="btn btn-sm" onclick="openAddCameraModal()" style="background: rgba(0, 242, 254, 0.12); border-color: var(--accent-cyan); color: var(--accent-cyan); font-weight: 600;">
                         ➕ Add Tapo / RTSP Camera
@@ -1154,7 +1158,7 @@ HTML_TEMPLATE = """
             }
         }
 
-        let matrixStreamMode = 'live'; // 'live' or 'eco'
+        let matrixStreamMode = 'eco'; // 'eco' (periodic snapshot, 0 socket starvation) or 'live'
 
         function setMatrixStreamMode(mode) {
             matrixStreamMode = mode;
@@ -1275,9 +1279,16 @@ HTML_TEMPLATE = """
                     // In eco mode, update snapshots smoothly
                     if (matrixStreamMode === 'eco') {
                         const img = document.getElementById(`matrix-img-${cam.id}`);
-                        if (img && cam.is_active) {
+                        if (img && cam.is_active && !img._loadingSnapshot) {
+                            img._loadingSnapshot = true;
                             const next = new Image();
-                            next.onload = () => { img.src = next.src; };
+                            next.onload = () => {
+                                img.src = next.src;
+                                img._loadingSnapshot = false;
+                            };
+                            next.onerror = () => {
+                                img._loadingSnapshot = false;
+                            };
                             next.src = `/api/cameras/${cam.id}/snapshot?res=480p&t=${Date.now()}`;
                         }
                     }
@@ -1287,7 +1298,7 @@ HTML_TEMPLATE = """
 
             // Full render of cards
             container.innerHTML = cachedCameras.map(cam => {
-                const streamUrl = (matrixStreamMode === 'live')
+                const streamUrl = (matrixStreamMode === 'live' && cam.is_active)
                     ? `/api/cameras/${cam.id}/stream?res=480p`
                     : `/api/cameras/${cam.id}/snapshot?res=480p&t=${Date.now()}`;
 
@@ -1345,12 +1356,23 @@ HTML_TEMPLATE = """
                 btn.innerText = targetState ? 'Starting...' : 'Stopping...';
             }
 
+            // Immediately disconnect the matrix image/stream so the browser frees the TCP connection slot
+            const img = document.getElementById(`matrix-img-${camId}`);
+            if (img && !targetState) {
+                img.src = '';
+            }
+
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 4000);
+
             try {
                 const res = await fetch(`/api/cameras/${camId}/capture`, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ enabled: targetState })
+                    body: JSON.stringify({ enabled: targetState }),
+                    signal: controller.signal
                 });
+                clearTimeout(timeoutId);
                 const data = await res.json();
                 if (data.status === 'ok') {
                     if (cam) cam.is_active = data.is_capture_active;
@@ -1367,18 +1389,24 @@ HTML_TEMPLATE = """
                             btn.style.color = '#6ee7b7';
                         }
                     }
-                    if (matrixStreamMode === 'eco') {
-                        const img = document.getElementById(`matrix-img-${camId}`);
-                        if (img) {
+                    if (img) {
+                        if (matrixStreamMode === 'live' && data.is_capture_active) {
+                            img.src = `/api/cameras/${camId}/stream?res=480p&t=${Date.now()}`;
+                        } else {
                             img.src = `/api/cameras/${camId}/snapshot?res=480p&t=${Date.now()}`;
                         }
                     }
-                    updateStats();
+                    await updateStats();
                 } else {
                     alert('Failed to toggle camera capture: ' + (data.detail || 'Error'));
                 }
             } catch(e) {
-                alert('Error toggling camera capture: ' + e);
+                clearTimeout(timeoutId);
+                console.error('Error toggling camera capture:', e);
+                if (btn && cam) {
+                    btn.innerHTML = cam.is_active ? '⏸️ Stop' : '▶️ Start';
+                }
+                await updateStats();
             } finally {
                 if (btn) btn.disabled = false;
             }
@@ -1523,6 +1551,15 @@ HTML_TEMPLATE = """
             const btn = document.getElementById('btn-toggle-capture');
             const targetState = !isCaptureActive;
             if (btn) btn.disabled = true;
+
+            const feed = document.getElementById('single-video-feed');
+            if (feed && !targetState) {
+                feed.src = '';
+            }
+
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 4000);
+
             try {
                 const endpoint = (currentViewMode === 'single' && activeCameraId) 
                     ? `/api/cameras/${activeCameraId}/capture` 
@@ -1531,19 +1568,26 @@ HTML_TEMPLATE = """
                 const res = await fetch(endpoint, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ enabled: targetState })
+                    body: JSON.stringify({ enabled: targetState }),
+                    signal: controller.signal
                 });
+                clearTimeout(timeoutId);
                 const data = await res.json();
                 if (data.status === 'ok') {
                     isCaptureActive = data.is_capture_active;
-                    const feed = document.getElementById('single-video-feed');
                     if (feed && currentViewMode === 'single') {
-                        feed.src = `/api/cameras/${activeCameraId}/stream?res=${currentResolution}&t=${Date.now()}`;
+                        if (data.is_capture_active) {
+                            feed.src = `/api/cameras/${activeCameraId}/stream?res=${currentResolution}&t=${Date.now()}`;
+                        } else {
+                            feed.src = `/api/cameras/${activeCameraId}/snapshot?res=480p&t=${Date.now()}`;
+                        }
                     }
-                    updateStats();
+                    await updateStats();
                 }
             } catch(e) {
-                alert('Failed to toggle camera capture: ' + e);
+                clearTimeout(timeoutId);
+                console.error('Failed to toggle camera capture:', e);
+                await updateStats();
             } finally {
                 if (btn) btn.disabled = false;
             }

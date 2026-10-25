@@ -176,12 +176,17 @@ class VideoCamera:
 
         while not self.stopped:
             if not self.is_capture_active:
-                if self.cam_type == "local" and self.cap is not None:
+                if self.cam_type == "rtsp" and self.cap is not None and self.cap.isOpened():
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                elif self.cam_type == "local" and self.cap is not None:
                     try:
                         self.cap.grab()
                     except Exception:
                         pass
-                time.sleep(0.15)
+                time.sleep(0.2)
                 continue
 
             if self.cam_type == "rtsp" and (self.cap is None or not self.cap.isOpened()):
