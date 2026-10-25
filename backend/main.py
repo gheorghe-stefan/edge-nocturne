@@ -1244,15 +1244,29 @@ HTML_TEMPLATE = """
                     const statusDot = document.getElementById(`cam-dot-${cam.id}`);
                     const detText = document.getElementById(`cam-det-${cam.id}`);
                     const resBadge = document.getElementById(`cam-res-${cam.id}`);
+                    const pauseBtn = document.getElementById(`btn-pause-${cam.id}`);
                     if (statusDot) {
                         statusDot.style.backgroundColor = cam.is_active ? 'var(--status-green)' : '#fca5a5';
                     }
                     if (resBadge) {
                         resBadge.innerText = cam.resolution;
                     }
+                    if (pauseBtn) {
+                        if (cam.is_active) {
+                            pauseBtn.innerHTML = '⏸️ Stop';
+                            pauseBtn.style.background = 'rgba(239, 68, 68, 0.15)';
+                            pauseBtn.style.borderColor = 'rgba(239, 68, 68, 0.4)';
+                            pauseBtn.style.color = '#fca5a5';
+                        } else {
+                            pauseBtn.innerHTML = '▶️ Start';
+                            pauseBtn.style.background = 'rgba(16, 185, 129, 0.2)';
+                            pauseBtn.style.borderColor = 'rgba(16, 185, 129, 0.5)';
+                            pauseBtn.style.color = '#6ee7b7';
+                        }
+                    }
                     if (detText) {
                         if (!cam.is_active) {
-                            detText.innerHTML = '<span style="color: #fca5a5;">⏸️ Capture Paused</span>';
+                            detText.innerHTML = '<span style="color: #fca5a5;">⏸️ Stopped</span>';
                         } else if (cam.detections && cam.detections.length > 0) {
                             const items = cam.detections.map(d => `${d.label} (${Math.round(d.confidence*100)}%)`).join(', ');
                             detText.innerHTML = `🎯 <strong style="color: var(--alert-orange);">${items}</strong>`;
@@ -1301,15 +1315,18 @@ HTML_TEMPLATE = """
                         </div>
 
                         <div class="matrix-card-footer">
-                            <div id="cam-det-${cam.id}" style="font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%;">
-                                ${cam.is_active ? topItems : '<span style="color: #fca5a5;">⏸️ Paused</span>'}
+                            <div id="cam-det-${cam.id}" style="font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 45%;">
+                                ${cam.is_active ? topItems : '<span style="color: #fca5a5;">⏸️ Stopped</span>'}
                             </div>
-                            <div style="display: flex; gap: 0.4rem; align-items: center;">
-                                <button class="btn btn-sm" onclick="focusCamera(${cam.id})" style="padding: 0.25rem 0.6rem; font-size: 0.78rem;">
+                            <div style="display: flex; gap: 0.35rem; align-items: center;">
+                                <button class="btn btn-sm" id="btn-pause-${cam.id}" onclick="event.stopPropagation(); toggleSpecificCameraCapture(${cam.id})" style="${cam.is_active ? 'background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.4); color: #fca5a5;' : 'background: rgba(16, 185, 129, 0.2); border-color: rgba(16, 185, 129, 0.5); color: #6ee7b7;'} padding: 0.25rem 0.55rem; font-size: 0.78rem;" title="${cam.is_active ? 'Stop / Pause Camera Stream' : 'Start / Resume Camera Stream'}">
+                                    ${cam.is_active ? '⏸️ Stop' : '▶️ Start'}
+                                </button>
+                                <button class="btn btn-sm" onclick="event.stopPropagation(); focusCamera(${cam.id})" style="padding: 0.25rem 0.55rem; font-size: 0.78rem;">
                                     🔍 Focus
                                 </button>
                                 ${cam.id !== 1 ? `
-                                    <button class="btn btn-sm" onclick="deleteCamera(${cam.id}, '${cam.name}')" style="background: rgba(255, 68, 68, 0.12); border-color: #ff4444; color: #ff6b6b; padding: 0.25rem 0.5rem;" title="Remove Camera">
+                                    <button class="btn btn-sm" onclick="event.stopPropagation(); deleteCamera(${cam.id}, '${cam.name}')" style="background: rgba(255, 68, 68, 0.12); border-color: #ff4444; color: #ff6b6b; padding: 0.25rem 0.5rem;" title="Remove Camera">
                                         🗑️
                                     </button>
                                 ` : ''}
@@ -1318,6 +1335,40 @@ HTML_TEMPLATE = """
                     </div>
                 `;
             }).join('');
+        }
+
+        async function toggleSpecificCameraCapture(camId) {
+            const cam = cachedCameras.find(c => c.id === camId);
+            const targetState = cam ? !cam.is_active : false;
+            const btn = document.getElementById(`btn-pause-${camId}`);
+            if (btn) btn.disabled = true;
+
+            try {
+                const res = await fetch(`/api/cameras/${camId}/capture`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ enabled: targetState })
+                });
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    if (cam) cam.is_active = data.is_capture_active;
+                    const img = document.getElementById(`matrix-img-${camId}`);
+                    if (img) {
+                        if (matrixStreamMode === 'live') {
+                            img.src = `/api/cameras/${camId}/stream?res=480p&t=${Date.now()}`;
+                        } else {
+                            img.src = `/api/cameras/${camId}/snapshot?res=480p&t=${Date.now()}`;
+                        }
+                    }
+                    updateStats();
+                } else {
+                    alert('Failed to toggle camera capture: ' + (data.detail || 'Error'));
+                }
+            } catch(e) {
+                alert('Error toggling camera capture: ' + e);
+            } finally {
+                if (btn) btn.disabled = false;
+            }
         }
 
         async function refreshCamerasList() {
