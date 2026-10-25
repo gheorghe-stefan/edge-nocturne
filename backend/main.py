@@ -159,14 +159,15 @@ def camera_video_stream(camera_id: int, res: Optional[str] = "1080p"):
 
 
 @app.get("/api/cameras/{camera_id}/snapshot")
-def get_camera_snapshot(camera_id: int):
-    """Returns a single clean high-quality JPEG snapshot for a specific camera."""
+def get_camera_snapshot(camera_id: int, res: Optional[str] = None):
+    """Returns a single clean JPEG snapshot for a specific camera."""
     if not camera_manager:
         return Response(status_code=503, content="Camera manager not initialized")
     cam = camera_manager.get_camera(camera_id)
     if not cam:
         return Response(status_code=404, content="Camera not found")
-    frame_bytes = cam.get_jpeg_bytes(quality=95)
+    quality = 80 if res else 95
+    frame_bytes = cam.get_jpeg_bytes(quality=quality, resolution=res)
     if not frame_bytes:
         return Response(status_code=500, content="Failed to capture frame")
     return Response(content=frame_bytes, media_type="image/jpeg")
@@ -873,7 +874,12 @@ HTML_TEMPLATE = """
                         <option value="matrix">🔲 All Cameras (Matrix Grid)</option>
                     </select>
                 </div>
-                <div style="display: flex; gap: 0.5rem; align-items: center;">
+                <div style="display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap;">
+                    <div class="res-bar" id="matrix-mode-bar">
+                        <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 600;">Matrix:</span>
+                        <button class="res-btn active" id="btn-matrix-live" onclick="setMatrixStreamMode('live')">⚡ Live Stream</button>
+                        <button class="res-btn" id="btn-matrix-eco" onclick="setMatrixStreamMode('eco')">📷 Eco Refresh</button>
+                    </div>
                     <button class="btn btn-sm" onclick="openAddCameraModal()" style="background: rgba(0, 242, 254, 0.12); border-color: var(--accent-cyan); color: var(--accent-cyan); font-weight: 600;">
                         ➕ Add Tapo / RTSP Camera
                     </button>
@@ -900,7 +906,7 @@ HTML_TEMPLATE = """
 
                 <div class="video-container">
                     <div class="hud-overlay" id="hud-res">FEED: 1920x1080 @ 30 FPS</div>
-                    <img id="single-video-feed" class="video-feed" src="/api/stream" alt="Edge Nocturne Live Feed" />
+                    <img id="single-video-feed" class="video-feed" src="" alt="Edge Nocturne Live Feed" />
                     <div class="hud-detection-banner" id="detection-banner">
                         <span id="banner-text">AI Scanner: Watching scene...</span>
                         <span style="color: var(--text-muted); font-size: 0.8rem;" id="hud-cam-type">Clean Stream</span>
@@ -1151,12 +1157,40 @@ HTML_TEMPLATE = """
             }
         }
 
+        let matrixStreamMode = 'live'; // 'live' or 'eco'
+
+        function setMatrixStreamMode(mode) {
+            matrixStreamMode = mode;
+            const btnLive = document.getElementById('btn-matrix-live');
+            const btnEco = document.getElementById('btn-matrix-eco');
+            if (btnLive) btnLive.classList.toggle('active', mode === 'live');
+            if (btnEco) btnEco.classList.toggle('active', mode === 'eco');
+
+            // Re-render matrix cards cleanly with new stream mode
+            const container = document.getElementById('matrix-container');
+            if (container) container.innerHTML = '';
+            renderMatrix();
+        }
+
+        function onMatrixFeedError(camId) {
+            console.log(`[MATRIX] Stream limit reached or feed error for camera #${camId}, falling back to snapshot refresh`);
+            const img = document.getElementById(`matrix-img-${camId}`);
+            if (img) {
+                img.src = `/api/cameras/${camId}/snapshot?res=480p&t=${Date.now()}`;
+            }
+        }
+
         function focusCamera(cameraId) {
             currentViewMode = 'single';
             activeCameraId = cameraId;
             document.getElementById('camera-select').value = String(cameraId);
             document.getElementById('view-matrix').style.display = 'none';
             document.getElementById('view-single').style.display = 'block';
+
+            // Free matrix streams immediately so browser sockets are available for single view
+            document.querySelectorAll('.matrix-feed').forEach(img => {
+                img.src = '';
+            });
 
             const cam = cachedCameras.find(c => c.id === cameraId);
             if (cam) {
@@ -1181,6 +1215,15 @@ HTML_TEMPLATE = """
             document.getElementById('camera-select').value = 'matrix';
             document.getElementById('view-single').style.display = 'none';
             document.getElementById('view-matrix').style.display = 'block';
+
+            // Free single-view stream socket immediately so matrix mode gets all connection slots!
+            const singleFeed = document.getElementById('single-video-feed');
+            if (singleFeed) {
+                singleFeed.src = '';
+            }
+
+            const container = document.getElementById('matrix-container');
+            if (container) container.innerHTML = '';
             renderMatrix();
         }
 
@@ -1217,13 +1260,26 @@ HTML_TEMPLATE = """
                             detText.innerHTML = '<span style="color: var(--status-green);">🟢 Scene Clear</span>';
                         }
                     }
+
+                    // In eco mode, update snapshots smoothly
+                    if (matrixStreamMode === 'eco') {
+                        const img = document.getElementById(`matrix-img-${cam.id}`);
+                        if (img && cam.is_active) {
+                            const next = new Image();
+                            next.onload = () => { img.src = next.src; };
+                            next.src = `/api/cameras/${cam.id}/snapshot?res=480p&t=${Date.now()}`;
+                        }
+                    }
                 });
                 return;
             }
 
             // Full render of cards
             container.innerHTML = cachedCameras.map(cam => {
-                const streamUrl = `/api/cameras/${cam.id}/stream?res=720p`;
+                const streamUrl = (matrixStreamMode === 'live')
+                    ? `/api/cameras/${cam.id}/stream?res=480p`
+                    : `/api/cameras/${cam.id}/snapshot?res=480p&t=${Date.now()}`;
+
                 const topItems = (cam.detections && cam.detections.length > 0)
                     ? cam.detections.map(d => `${d.label} (${Math.round(d.confidence*100)}%)`).join(', ')
                     : '🟢 Scene Clear';
@@ -1240,7 +1296,7 @@ HTML_TEMPLATE = """
                         </div>
 
                         <div class="matrix-feed-box" onclick="focusCamera(${cam.id})" title="Click to Maximize">
-                            <img class="matrix-feed" src="${streamUrl}" alt="${cam.name}" loading="lazy" />
+                            <img class="matrix-feed" id="matrix-img-${cam.id}" src="${streamUrl}" alt="${cam.name}" onerror="onMatrixFeedError(${cam.id})" />
                             <div class="matrix-click-hint">🔍 Click to Maximize</div>
                         </div>
 

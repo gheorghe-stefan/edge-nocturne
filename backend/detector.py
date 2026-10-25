@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 import cv2
@@ -55,6 +56,7 @@ class ObjectDetector:
         self.is_yolo = False
         self.net = None
         self.interpreter = None
+        self.lock = threading.Lock()
 
         # Check for YOLO ONNX model (prefer 960x960 for max wildlife/yard resolution, then 640x640)
         if os.path.exists("models/yolov8n_960.onnx"):
@@ -109,10 +111,11 @@ class ObjectDetector:
         """Runs inference and returns normalized detections [ymin, xmin, ymax, xmax] and latency ms."""
         start_time = time.perf_counter()
 
-        if self.is_yolo:
-            detections = self._detect_yolo(bgr_frame)
-        else:
-            detections = self._detect_litert(bgr_frame)
+        with self.lock:
+            if self.is_yolo:
+                detections = self._detect_yolo(bgr_frame)
+            else:
+                detections = self._detect_litert(bgr_frame)
 
         latency_ms = round((time.perf_counter() - start_time) * 1000.0, 1)
         return detections, latency_ms
