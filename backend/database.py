@@ -86,6 +86,69 @@ def init_db():
         );
     """)
 
+    # Table 3: Configured cameras (Local V4L2 USB and Remote RTSP/Tapo)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS cameras (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        cam_type TEXT NOT NULL DEFAULT 'rtsp', -- 'local' or 'rtsp'
+        source TEXT NOT NULL,
+        enabled INTEGER DEFAULT 1,
+        enable_ml INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+
+    cursor.execute("SELECT COUNT(*) FROM cameras")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(
+            "INSERT INTO cameras (id, name, cam_type, source, enabled, enable_ml) VALUES (1, 'Arducam USB (Local)', 'local', '0', 1, 1)"
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def get_db_cameras() -> List[Dict[str, Any]]:
+    """Returns all configured cameras."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, cam_type, source, enabled, enable_ml, created_at FROM cameras ORDER BY id ASC")
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def add_db_camera(name: str, source: str, cam_type: str = "rtsp", enable_ml: int = 1) -> int:
+    """Adds a new camera (e.g. Tapo RTSP stream) to the database."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO cameras (name, cam_type, source, enabled, enable_ml) VALUES (?, ?, ?, 1, ?)",
+        (name.strip(), cam_type, source.strip(), enable_ml),
+    )
+    cam_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return cam_id
+
+
+def delete_db_camera(camera_id: int) -> bool:
+    """Deletes a camera configuration from the database."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM cameras WHERE id = ?", (camera_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def update_db_camera_status(camera_id: int, enabled: int):
+    """Updates enabled/disabled status of a camera."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE cameras SET enabled = ? WHERE id = ?", (enabled, camera_id))
     conn.commit()
     conn.close()
 

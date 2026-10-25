@@ -208,7 +208,12 @@ class VideoRecorder:
                 confidence=det.get("confidence", 0.0),
                 snapshot_filename=snap_filename,
                 clip_filename=clip_filename,
-                metadata={"box": det.get("box"), "resolution": f"{self.width}x{self.height}"},
+                metadata={
+                    "box": det.get("box"),
+                    "resolution": f"{self.width}x{self.height}",
+                    "camera_id": det.get("camera_id"),
+                    "camera_name": det.get("camera_name"),
+                },
                 embedding=embedding,
                 entity_id=matched_entity_id,
             )

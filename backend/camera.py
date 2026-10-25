@@ -1,7 +1,7 @@
 import cv2
 import threading
 import time
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 from backend.detector import ObjectDetector
 from backend.recorder import VideoRecorder
 from backend.tracker import MultiObjectTracker
@@ -10,47 +10,86 @@ from backend.database import find_matching_entity
 
 
 class VideoCamera:
-    """Threaded camera capture + asynchronous background LiteRT ML + dual-mode recording."""
+    """Threaded camera capture (Local V4L2 USB or Remote RTSP/Tapo) + ML + dual-mode recording."""
 
     def __init__(
         self,
-        device_id: Optional[int] = None,
+        camera_id: int = 1,
+        name: str = "Arducam USB (Local)",
+        source: Any = None,
+        cam_type: str = "local",
         width: int = 1920,
         height: int = 1080,
         fps: int = 30,
         enable_ml: bool = True,
+        shared_detector: Optional[ObjectDetector] = None,
     ):
-        if device_id is None:
-            device_id = self._find_camera_device()
-
-        self.device_id = device_id
+        self.camera_id = camera_id
+        self.name = name
+        self.cam_type = cam_type
         self.width = width
         self.height = height
         self.fps = fps
         self.enable_ml = enable_ml
 
-        # Initialize camera with V4L2 backend and MJPG hardware compression
-        self.cap = cv2.VideoCapture(self.device_id, cv2.CAP_V4L2)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+        # Determine stream source type
+        is_rtsp = False
+        if cam_type == "rtsp" or (isinstance(source, str) and (source.startswith("rtsp://") or source.startswith("http://") or source.startswith("https://"))):
+            is_rtsp = True
+            self.cam_type = "rtsp"
+            self.source = str(source)
+            self.device_id = None
+        else:
+            self.cam_type = "local"
+            if source is None:
+                self.device_id = self._find_camera_device()
+            elif isinstance(source, int):
+                self.device_id = source
+            elif isinstance(source, str) and source.isdigit():
+                self.device_id = int(source)
+            else:
+                self.device_id = self._find_camera_device()
+            self.source = str(self.device_id)
 
-        self.grabbed, self.frame = self.cap.read()
+        # Initialize capture backend
+        if is_rtsp:
+            import os
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+            print(f"[INFO] Connecting to RTSP Camera #{self.camera_id} '{self.name}' ({self.source})...")
+            self.cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+            self.grabbed, self.frame = self.cap.read()
+            if self.grabbed and self.frame is not None:
+                h, w = self.frame.shape[:2]
+                self.height, self.width = h, w
+                print(f"[INFO] RTSP Camera #{self.camera_id} connected! Native resolution: {self.width}x{self.height}")
+            else:
+                print(f"[WARN] Initial frame grab failed for RTSP Camera #{self.camera_id} ({self.source}). Will retry in loop.")
+                self.grabbed = False
+                self.frame = None
+        else:
+            # Initialize camera with V4L2 backend and MJPG hardware compression
+            print(f"[INFO] Initializing Local USB Camera #{self.camera_id} on index {self.device_id}...")
+            self.cap = cv2.VideoCapture(self.device_id, cv2.CAP_V4L2)
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            self.cap.set(cv2.CAP_PROP_FPS, self.fps)
 
-        # Fallback search if specified device failed to grab initial frame
-        if not self.grabbed:
-            print(f"[WARN] Failed to read initial frame from camera device {self.device_id}, scanning...")
-            self.cap.release()
-            discovered = self._find_camera_device()
-            if discovered != self.device_id:
-                self.device_id = discovered
-                self.cap = cv2.VideoCapture(self.device_id, cv2.CAP_V4L2)
-                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-                self.cap.set(cv2.CAP_PROP_FPS, self.fps)
-                self.grabbed, self.frame = self.cap.read()
+            self.grabbed, self.frame = self.cap.read()
+
+            # Fallback search if specified device failed to grab initial frame
+            if not self.grabbed:
+                print(f"[WARN] Failed to read initial frame from camera device {self.device_id}, scanning...")
+                self.cap.release()
+                discovered = self._find_camera_device()
+                if discovered != self.device_id:
+                    self.device_id = discovered
+                    self.cap = cv2.VideoCapture(self.device_id, cv2.CAP_V4L2)
+                    self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                    self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+                    self.grabbed, self.frame = self.cap.read()
 
         self.frame_lock = threading.Lock()
         self.ml_lock = threading.Lock()
@@ -61,21 +100,21 @@ class VideoCamera:
         self.inference_ms: float = 0.0
         self.standby_frame = self._create_standby_frame(self.width, self.height)
 
-        if not self.grabbed:
+        if not self.grabbed and self.cam_type == "local":
             print(f"[WARN] Failed to read initial frame from camera device {self.device_id}")
 
         # Initialize Dual-mode Video Recorder (Event pre-roll + continuous DVR loop)
         self.recorder = VideoRecorder(width=self.width, height=self.height, fps=self.fps)
-        self.tracker = MultiObjectTracker(min_iou=0.25, max_age=3, min_hits_for_active=2)
+        self.tracker = MultiObjectTracker(min_iou=0.15, max_center_distance=0.25, max_age=15, min_hits_for_active=2)
 
-        # Thread 1: High-speed ingestion loop (30 FPS, zero lag)
+        # Thread 1: High-speed ingestion loop (zero lag)
         self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.capture_thread.start()
 
         # Thread 2: Asynchronous ML inference worker loop
         if self.enable_ml:
             try:
-                self.detector = ObjectDetector()
+                self.detector = shared_detector or ObjectDetector()
                 self.ml_thread = threading.Thread(target=self._inference_loop, daemon=True)
                 self.ml_thread.start()
             except Exception as e:
@@ -131,10 +170,13 @@ class VideoCamera:
         return 0
 
     def _capture_loop(self):
-        """Dedicated thread to constantly drain camera buffer at full frame rate."""
+        """Dedicated thread to constantly drain camera buffer at full frame rate with RTSP auto-reconnect."""
+        consecutive_failures = 0
+        last_reconnect_time = 0.0
+
         while not self.stopped:
             if not self.is_capture_active:
-                # Flush underlying V4L2 device buffer slowly without burning CPU
+                # Flush underlying device buffer slowly without burning CPU
                 try:
                     self.cap.grab()
                 except Exception:
@@ -145,15 +187,30 @@ class VideoCamera:
             try:
                 grabbed, frame = self.cap.read()
                 if grabbed and frame is not None:
+                    consecutive_failures = 0
                     with self.frame_lock:
                         self.grabbed = grabbed
                         self.frame = frame
                     self.recorder.add_frame(frame)
                 else:
-                    time.sleep(0.01)
+                    consecutive_failures += 1
+                    if self.cam_type == "rtsp" and consecutive_failures >= 15:
+                        now = time.time()
+                        if now - last_reconnect_time > 4.0:
+                            print(f"[WARN] Camera #{self.camera_id} ('{self.name}') feed lost ({consecutive_failures} fails). Reconnecting to RTSP...")
+                            try:
+                                self.cap.release()
+                            except Exception:
+                                pass
+                            time.sleep(1.0)
+                            self.cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+                            last_reconnect_time = time.time()
+                            consecutive_failures = 0
+                    time.sleep(0.02)
             except Exception as e:
-                print(f"[WARN] Camera capture loop warning: {e}")
-                time.sleep(0.02)
+                consecutive_failures += 1
+                print(f"[WARN] Camera #{self.camera_id} capture loop warning: {e}")
+                time.sleep(0.05)
 
     def _inference_loop(self):
         """Asynchronous ML worker running high-accuracy inference (~1.5 FPS) with online multi-object tracking."""
@@ -200,6 +257,8 @@ class VideoCamera:
                                 "entity_id": t.entity_id,
                                 "entity_name": t.entity_name,
                                 "embedding": t.best_embedding,
+                                "camera_id": self.camera_id,
+                                "camera_name": self.name,
                             }
                             for t in active_tracks
                         ]

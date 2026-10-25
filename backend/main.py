@@ -8,6 +8,7 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from backend.camera import VideoCamera
+from backend.camera_manager import CameraManager, mask_rtsp_url
 from backend.database import (
     EVENTS_DIR,
     auto_match_sightings_for_entity,
@@ -23,7 +24,7 @@ from backend.database import (
 )
 from backend.version import __version__
 
-camera: VideoCamera = None
+camera_manager: Optional[CameraManager] = None
 
 
 class TagRequest(BaseModel):
@@ -48,31 +49,45 @@ class CaptureSettingRequest(BaseModel):
     enabled: bool
 
 
+class AddCameraRequest(BaseModel):
+    name: str
+    source: str
+    enable_ml: Optional[bool] = True
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global camera
+    global camera_manager
     print(f"[INFO] Initializing Edge Nocturne v{__version__}...")
     init_db()
     # Run backfill asynchronously in background so web server starts immediately
     import threading
     threading.Thread(target=backfill_sightings_embeddings, daemon=True).start()
 
-    camera = VideoCamera(device_id=None, width=1920, height=1080, fps=30, enable_ml=True)
+    camera_manager = CameraManager()
+    camera_manager.load_cameras_from_db()
     yield
-    print("[INFO] Shutting down camera & recorder...")
-    if camera:
-        camera.stop()
+    print("[INFO] Shutting down cameras & recorder...")
+    if camera_manager:
+        camera_manager.stop_all()
 
 
 app = FastAPI(title="Edge Nocturne", version=__version__, lifespan=lifespan)
 
 
-def generate_mjpeg_stream(resolution: str = "1080p"):
-    """Generator yielding multipart JPEG frames for live browser streaming at requested resolution."""
+def generate_camera_mjpeg_stream(camera_id: Optional[int] = None, resolution: str = "1080p"):
+    """Generator yielding multipart JPEG frames for live browser streaming."""
     while True:
         try:
-            if camera:
-                frame_bytes = camera.get_jpeg_bytes(quality=80, resolution=resolution)
+            cam = None
+            if camera_manager:
+                cam = (
+                    camera_manager.get_camera(camera_id)
+                    if camera_id is not None
+                    else camera_manager.get_primary_camera()
+                )
+            if cam:
+                frame_bytes = cam.get_jpeg_bytes(quality=80, resolution=resolution)
                 if frame_bytes:
                     yield (
                         b"--frame\r\n"
@@ -85,21 +100,96 @@ def generate_mjpeg_stream(resolution: str = "1080p"):
             time.sleep(0.05)
 
 
+@app.get("/api/cameras")
+def list_cameras():
+    """Returns real-time status, FPS, resolution, and detections for all configured cameras."""
+    if not camera_manager:
+        return []
+    return camera_manager.get_all_status()
+
+
+@app.post("/api/cameras")
+def add_camera_route(req: AddCameraRequest):
+    """Registers a new RTSP stream (e.g. TP-Link Tapo) and starts ingestion immediately."""
+    if not camera_manager:
+        raise HTTPException(status_code=503, detail="Camera manager not ready")
+    if not req.name.strip():
+        raise HTTPException(status_code=400, detail="Camera name is required")
+    if not req.source.strip():
+        raise HTTPException(status_code=400, detail="Camera RTSP source URL is required")
+    try:
+        return camera_manager.add_camera(
+            name=req.name.strip(),
+            source=req.source.strip(),
+            enable_ml=req.enable_ml if req.enable_ml is not None else True,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to add camera: {e}")
+
+
+@app.delete("/api/cameras/{camera_id}")
+def delete_camera_route(camera_id: int):
+    """Removes a camera stream."""
+    if not camera_manager:
+        raise HTTPException(status_code=503, detail="Camera manager not ready")
+    if camera_id == 1:
+        raise HTTPException(status_code=400, detail="Cannot delete default primary camera")
+    success = camera_manager.remove_camera(camera_id)
+    return {"status": "ok" if success else "error"}
+
+
+@app.post("/api/cameras/{camera_id}/capture")
+def toggle_specific_camera_capture(camera_id: int, req: CaptureSettingRequest):
+    """Starts or stops live capture on a specific camera."""
+    if not camera_manager:
+        raise HTTPException(status_code=503, detail="Camera manager not ready")
+    success = camera_manager.set_camera_capture(camera_id, req.enabled)
+    if not success:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    return {"status": "ok", "camera_id": camera_id, "is_capture_active": req.enabled}
+
+
+@app.get("/api/cameras/{camera_id}/stream")
+def camera_video_stream(camera_id: int, res: Optional[str] = "1080p"):
+    """MJPEG low-latency streaming endpoint for a specific camera."""
+    return StreamingResponse(
+        generate_camera_mjpeg_stream(camera_id=camera_id, resolution=res),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.get("/api/cameras/{camera_id}/snapshot")
+def get_camera_snapshot(camera_id: int):
+    """Returns a single clean high-quality JPEG snapshot for a specific camera."""
+    if not camera_manager:
+        return Response(status_code=503, content="Camera manager not initialized")
+    cam = camera_manager.get_camera(camera_id)
+    if not cam:
+        return Response(status_code=404, content="Camera not found")
+    frame_bytes = cam.get_jpeg_bytes(quality=95)
+    if not frame_bytes:
+        return Response(status_code=500, content="Failed to capture frame")
+    return Response(content=frame_bytes, media_type="image/jpeg")
+
+
 @app.get("/api/stream")
 def video_stream(res: Optional[str] = "1080p"):
-    """MJPEG low-latency streaming endpoint with dynamic resolution selector (1080p, 720p, 480p)."""
+    """Default MJPEG streaming endpoint (primary camera)."""
     return StreamingResponse(
-        generate_mjpeg_stream(resolution=res),
+        generate_camera_mjpeg_stream(camera_id=None, resolution=res),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
 
 @app.get("/api/snapshot")
 def get_snapshot():
-    """Returns a single clean high-quality JPEG snapshot."""
-    if not camera:
-        return Response(status_code=503, content="Camera not initialized")
-    frame_bytes = camera.get_jpeg_bytes(quality=95)
+    """Default high-quality snapshot endpoint (primary camera)."""
+    if not camera_manager:
+        return Response(status_code=503, content="Camera manager not initialized")
+    cam = camera_manager.get_primary_camera()
+    if not cam:
+        return Response(status_code=503, content="No camera available")
+    frame_bytes = cam.get_jpeg_bytes(quality=95)
     if not frame_bytes:
         return Response(status_code=500, content="Failed to capture frame")
     return Response(content=frame_bytes, media_type="image/jpeg")
@@ -107,7 +197,7 @@ def get_snapshot():
 
 @app.get("/api/stats")
 def get_system_stats():
-    """Returns system temperature, camera status, ML detections, and storage telemetry."""
+    """Returns system temperature, cameras status, ML detections, and storage telemetry."""
     temp_str = "N/A"
     try:
         res = subprocess.run(["vcgencmd", "measure_temp"], capture_output=True, text=True)
@@ -121,12 +211,15 @@ def get_system_stats():
     is_dvr_active = False
     is_recording_event = False
     is_capture_active = True
+    camera = camera_manager.get_primary_camera() if camera_manager else None
 
     if camera:
         detections, inference_ms = camera.get_latest_detections()
         is_dvr_active = camera.is_continuous_recording()
         is_recording_event = camera.recorder.is_recording_event
         is_capture_active = camera.is_capture_active
+
+    all_cams = camera_manager.get_all_status() if camera_manager else []
 
     return {
         "status": "online" if is_capture_active else "paused",
@@ -140,6 +233,7 @@ def get_system_stats():
         "storage": get_storage_stats(),
         "continuous_recording": is_dvr_active,
         "is_recording_event": is_recording_event,
+        "cameras": all_cams,
     }
 
 
@@ -208,18 +302,24 @@ def trigger_reindex(force: bool = False):
 @app.post("/api/settings/continuous")
 def toggle_continuous_loop(req: ContinuousSettingRequest):
     """Enables or disables continuous DVR 5-minute loop recording."""
-    if not camera:
+    if not camera_manager:
+        raise HTTPException(status_code=503, detail="Camera manager not ready")
+    cam = camera_manager.get_primary_camera()
+    if not cam:
         raise HTTPException(status_code=503, detail="Camera not initialized")
-    camera.set_continuous_recording(req.enabled)
+    cam.set_continuous_recording(req.enabled)
     return {"status": "ok", "continuous_recording": req.enabled}
 
 
 @app.post("/api/settings/capture")
 def toggle_camera_capture(req: CaptureSettingRequest):
-    """Starts or stops live camera capture, streaming, and ML inference."""
-    if not camera:
+    """Starts or stops live camera capture on primary camera."""
+    if not camera_manager:
+        raise HTTPException(status_code=503, detail="Camera manager not ready")
+    cam = camera_manager.get_primary_camera()
+    if not cam:
         raise HTTPException(status_code=503, detail="Camera not initialized")
-    camera.set_capture_active(req.enabled)
+    cam.set_capture_active(req.enabled)
     return {"status": "ok", "is_capture_active": req.enabled}
 
 
@@ -509,6 +609,103 @@ HTML_TEMPLATE = """
             border-color: var(--accent-cyan);
             box-shadow: 0 0 15px rgba(0, 242, 254, 0.2);
         }
+        /* Multi-Camera Matrix & Selector Styles */
+        .camera-bar {
+            width: 100%;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 0.6rem 1rem;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+        }
+        .camera-select {
+            background: #0d1424;
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 0.45rem 0.8rem;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .camera-select:focus {
+            outline: none;
+            border-color: var(--accent-cyan);
+        }
+        .matrix-grid {
+            width: 100%;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
+            gap: 1.25rem;
+        }
+        @media (max-width: 600px) {
+            .matrix-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        .matrix-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+            transition: all 0.2s ease;
+        }
+        .matrix-card:hover {
+            border-color: var(--accent-cyan);
+            box-shadow: 0 10px 25px rgba(0, 242, 254, 0.15);
+        }
+        .matrix-card-header {
+            padding: 0.6rem 0.9rem;
+            background: rgba(10, 14, 23, 0.85);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .matrix-feed-box {
+            position: relative;
+            cursor: pointer;
+            background: #000;
+        }
+        .matrix-feed {
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            object-fit: cover;
+            display: block;
+        }
+        .matrix-click-hint {
+            position: absolute;
+            top: 0.5rem;
+            right: 0.5rem;
+            background: rgba(10, 14, 23, 0.7);
+            color: var(--text-muted);
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            backdrop-filter: blur(4px);
+            pointer-events: none;
+            transition: opacity 0.2s ease;
+        }
+        .matrix-card:hover .matrix-click-hint {
+            color: var(--accent-cyan);
+        }
+        .matrix-card-footer {
+            padding: 0.6rem 0.9rem;
+            background: rgba(10, 14, 23, 0.85);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-top: 1px solid var(--border-color);
+            font-size: 0.82rem;
+        }
         /* Sightings Gallery Cards */
         .sightings-grid {
             width: 100%;
@@ -668,40 +865,74 @@ HTML_TEMPLATE = """
     <main>
         <!-- Tab 1: Live Monitor -->
         <div class="tab-content active" id="tab-live">
-            <div class="video-container">
-                <div class="hud-overlay" id="hud-res">FEED: 1920x1080 @ 30 FPS</div>
-                <img class="video-feed" src="/api/stream" alt="Edge Nocturne Live Feed" />
-                <div class="hud-detection-banner" id="detection-banner">
-                    <span id="banner-text">AI Scanner: Watching scene...</span>
-                    <span style="color: var(--text-muted); font-size: 0.8rem;">Clean 1080p Stream</span>
+            <!-- Camera Selector & Ingestion Bar -->
+            <div class="camera-bar">
+                <div style="display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
+                    <span style="font-size: 0.85rem; font-weight: 600; color: var(--text-muted);">📷 View Mode:</span>
+                    <select id="camera-select" class="camera-select" onchange="onCameraSelectChange(this.value)">
+                        <option value="matrix">🔲 All Cameras (Matrix Grid)</option>
+                    </select>
+                </div>
+                <div style="display: flex; gap: 0.5rem; align-items: center;">
+                    <button class="btn btn-sm" onclick="openAddCameraModal()" style="background: rgba(0, 242, 254, 0.12); border-color: var(--accent-cyan); color: var(--accent-cyan); font-weight: 600;">
+                        ➕ Add Tapo / RTSP Camera
+                    </button>
                 </div>
             </div>
-            <div class="controls-row">
-                <div style="display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap;">
-                    <button id="btn-toggle-capture" class="btn" onclick="toggleCameraCapture()" style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #fca5a5; font-weight: 600; display: flex; align-items: center; gap: 0.5rem; padding: 0.55rem 1rem;">
-                        <span id="capture-icon">⏸️</span>
-                        <span id="capture-text">Stop Capture</span>
+
+            <!-- View 1: Multi-Camera Matrix View -->
+            <div id="view-matrix" style="width: 100%;">
+                <div class="matrix-grid" id="matrix-container">
+                    <p style="color: var(--text-muted); padding: 2rem;">Loading camera feeds...</p>
+                </div>
+            </div>
+
+            <!-- View 2: Single-Camera Focused View -->
+            <div id="view-single" style="width: 100%; display: none;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; flex-wrap: wrap; gap: 0.5rem;">
+                    <button class="btn btn-sm" onclick="backToMatrix()" style="background: rgba(0, 242, 254, 0.15); border-color: var(--accent-cyan); color: var(--accent-cyan); font-weight: 600;">
+                        🔙 Back to Matrix (All Cameras)
                     </button>
-                    <div class="dvr-toggle-box">
-                        <label class="switch">
-                            <input type="checkbox" id="dvr-toggle" onchange="toggleContinuousDVR(this.checked)">
-                            <span class="slider"></span>
-                        </label>
-                        <div>
-                            <div style="font-size: 0.9rem; font-weight: 600;">Continuous DVR Loop</div>
-                            <div style="font-size: 0.75rem; color: var(--text-muted);">Keep last 24h • 15% Min Free Guard</div>
-                        </div>
+                    <div id="single-cam-title" style="font-size: 1rem; font-weight: 700; color: var(--accent-cyan);">
+                        Arducam USB (Local)
                     </div>
                 </div>
-                <div class="res-bar">
-                    <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 600;">Stream:</span>
-                    <button class="res-btn active" id="btn-res-1080p" onclick="setResolution('1080p')">1080p</button>
-                    <button class="res-btn" id="btn-res-720p" onclick="setResolution('720p')">720p</button>
-                    <button class="res-btn" id="btn-res-480p" onclick="setResolution('480p')">480p</button>
+
+                <div class="video-container">
+                    <div class="hud-overlay" id="hud-res">FEED: 1920x1080 @ 30 FPS</div>
+                    <img id="single-video-feed" class="video-feed" src="/api/stream" alt="Edge Nocturne Live Feed" />
+                    <div class="hud-detection-banner" id="detection-banner">
+                        <span id="banner-text">AI Scanner: Watching scene...</span>
+                        <span style="color: var(--text-muted); font-size: 0.8rem;" id="hud-cam-type">Clean Stream</span>
+                    </div>
                 </div>
-                <div style="display: flex; gap: 0.5rem;">
-                    <a class="btn" href="/api/snapshot" target="_blank">📸 Snapshot</a>
-                    <button class="btn" onclick="toggleFullscreen()">⛶ Fullscreen</button>
+                <div class="controls-row">
+                    <div style="display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap;">
+                        <button id="btn-toggle-capture" class="btn" onclick="toggleCameraCapture()" style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #fca5a5; font-weight: 600; display: flex; align-items: center; gap: 0.5rem; padding: 0.55rem 1rem;">
+                            <span id="capture-icon">⏸️</span>
+                            <span id="capture-text">Stop Capture</span>
+                        </button>
+                        <div class="dvr-toggle-box">
+                            <label class="switch">
+                                <input type="checkbox" id="dvr-toggle" onchange="toggleContinuousDVR(this.checked)">
+                                <span class="slider"></span>
+                            </label>
+                            <div>
+                                <div style="font-size: 0.9rem; font-weight: 600;">Continuous DVR Loop</div>
+                                <div style="font-size: 0.75rem; color: var(--text-muted);">Keep last 24h • 15% Min Free Guard</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="res-bar">
+                        <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 600;">Stream:</span>
+                        <button class="res-btn active" id="btn-res-1080p" onclick="setResolution('1080p')">1080p</button>
+                        <button class="res-btn" id="btn-res-720p" onclick="setResolution('720p')">720p</button>
+                        <button class="res-btn" id="btn-res-480p" onclick="setResolution('480p')">480p</button>
+                    </div>
+                    <div style="display: flex; gap: 0.5rem;">
+                        <a id="btn-snapshot-link" class="btn" href="/api/snapshot" target="_blank">📸 Snapshot</a>
+                        <button class="btn" onclick="toggleFullscreen()">⛶ Fullscreen</button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -768,6 +999,46 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
+    <!-- Modal Add Camera -->
+    <div class="modal" id="add-camera-modal">
+        <div class="modal-content" style="max-width: 580px; padding: 1.5rem;">
+            <div class="modal-header" style="border: none; padding: 0 0 1rem 0;">
+                <div style="font-size: 1.15rem; font-weight: 700; color: var(--accent-cyan); display: flex; align-items: center; gap: 0.5rem;">
+                    📹 Add TP-Link Tapo / RTSP Camera
+                </div>
+                <button class="modal-close" onclick="closeAddCameraModal()">✕</button>
+            </div>
+            
+            <div style="background: rgba(0, 242, 254, 0.05); border: 1px solid rgba(0, 242, 254, 0.2); border-radius: 8px; padding: 0.85rem; margin-bottom: 1.2rem; font-size: 0.82rem; line-height: 1.45;">
+                <strong style="color: var(--accent-cyan); display: block; margin-bottom: 0.3rem;">💡 TP-Link Tapo Setup Guide:</strong>
+                1. Open the TP-Link Tapo App: <em>Camera Settings ⚙️ ➔ Advanced Settings ➔ Camera Account</em>.<br>
+                2. Create a local username & password (e.g. <code>tapo_user</code>).<br>
+                3. RTSP URL format: <code>rtsp://username:password@&lt;camera-ip&gt;:554/stream1</code> (or <code>/stream2</code> for sub-stream).
+            </div>
+
+            <form id="add-camera-form" onsubmit="submitAddCamera(event)">
+                <div style="margin-bottom: 1rem;">
+                    <label style="display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 0.4rem; color: var(--text-primary);">Camera Name</label>
+                    <input type="text" id="add-cam-name" placeholder="e.g. Driveway Tapo C310" required class="tag-input" style="width: 100%; padding: 0.6rem 0.8rem; font-size: 0.9rem;" />
+                </div>
+                <div style="margin-bottom: 1rem;">
+                    <label style="display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 0.4rem; color: var(--text-primary);">RTSP Stream URL</label>
+                    <input type="text" id="add-cam-url" placeholder="rtsp://tapo_user:mypassword@192.168.0.120:554/stream1" required class="tag-input" style="width: 100%; padding: 0.6rem 0.8rem; font-size: 0.9rem; font-family: monospace;" />
+                </div>
+                <div style="margin-bottom: 1.25rem; display: flex; align-items: center; gap: 0.6rem;">
+                    <input type="checkbox" id="add-cam-ml" checked style="width: 16px; height: 16px; accent-color: var(--accent-cyan);" />
+                    <label for="add-cam-ml" style="font-size: 0.85rem; color: var(--text-primary); cursor: pointer;">Enable AI Object Detection & Identity Tracking</label>
+                </div>
+                <div style="display: flex; justify-content: flex-end; gap: 0.6rem;">
+                    <button type="button" class="btn btn-sm" onclick="closeAddCameraModal()">Cancel</button>
+                    <button type="submit" id="btn-save-camera" class="btn btn-sm" style="background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue)); color: #000; font-weight: 700;">
+                        Connect Camera
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <script>
         let currentSubView = 'entities';
 
@@ -799,7 +1070,227 @@ HTML_TEMPLATE = """
             }
         }
 
+        let currentViewMode = 'matrix'; // 'matrix' or 'single'
+        let activeCameraId = 1;
+        let cachedCameras = [];
+        let currentResolution = '1080p';
         let isCaptureActive = true;
+
+        function openAddCameraModal() {
+            document.getElementById('add-camera-modal').classList.add('open');
+            document.getElementById('add-cam-name').focus();
+        }
+
+        function closeAddCameraModal() {
+            document.getElementById('add-camera-modal').classList.remove('open');
+        }
+
+        async function submitAddCamera(e) {
+            e.preventDefault();
+            const name = document.getElementById('add-cam-name').value.trim();
+            const source = document.getElementById('add-cam-url').value.trim();
+            const enable_ml = document.getElementById('add-cam-ml').checked;
+            const btn = document.getElementById('btn-save-camera');
+
+            if (!name || !source) return;
+            btn.disabled = true;
+            btn.innerText = 'Connecting...';
+
+            try {
+                const res = await fetch('/api/cameras', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ name, source, enable_ml })
+                });
+                const data = await res.json();
+                if (res.ok && data.id) {
+                    closeAddCameraModal();
+                    document.getElementById('add-camera-form').reset();
+                    await refreshCamerasList();
+                    focusCamera(data.id);
+                } else {
+                    alert('Failed to add camera: ' + (data.detail || 'Connection error'));
+                }
+            } catch(err) {
+                alert('Error adding camera: ' + err);
+            } finally {
+                btn.disabled = false;
+                btn.innerText = 'Connect Camera';
+            }
+        }
+
+        async function deleteCamera(id, name) {
+            if (id === 1) {
+                alert('Default primary camera cannot be removed.');
+                return;
+            }
+            if (!confirm(`Are you sure you want to remove '${name}'?`)) {
+                return;
+            }
+            try {
+                const res = await fetch('/api/cameras/' + id, { method: 'DELETE' });
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    if (activeCameraId === id) {
+                        backToMatrix();
+                    }
+                    await refreshCamerasList();
+                } else {
+                    alert('Failed to remove camera: ' + (data.detail || 'Error'));
+                }
+            } catch(e) {
+                alert('Error removing camera: ' + e);
+            }
+        }
+
+        function onCameraSelectChange(val) {
+            if (val === 'matrix') {
+                backToMatrix();
+            } else {
+                focusCamera(parseInt(val, 10));
+            }
+        }
+
+        function focusCamera(cameraId) {
+            currentViewMode = 'single';
+            activeCameraId = cameraId;
+            document.getElementById('camera-select').value = String(cameraId);
+            document.getElementById('view-matrix').style.display = 'none';
+            document.getElementById('view-single').style.display = 'block';
+
+            const cam = cachedCameras.find(c => c.id === cameraId);
+            if (cam) {
+                document.getElementById('single-cam-title').innerText = `${cam.name} (${cam.cam_type.toUpperCase()})`;
+                const badge = document.getElementById('hud-cam-type');
+                if (badge) badge.innerText = `${cam.cam_type.toUpperCase()} • ${cam.source}`;
+            }
+
+            const feed = document.getElementById('single-video-feed');
+            if (feed) {
+                feed.src = `/api/cameras/${cameraId}/stream?res=${currentResolution}&t=${Date.now()}`;
+            }
+            const snapBtn = document.getElementById('btn-snapshot-link');
+            if (snapBtn) {
+                snapBtn.href = `/api/cameras/${cameraId}/snapshot`;
+            }
+            updateStats();
+        }
+
+        function backToMatrix() {
+            currentViewMode = 'matrix';
+            document.getElementById('camera-select').value = 'matrix';
+            document.getElementById('view-single').style.display = 'none';
+            document.getElementById('view-matrix').style.display = 'block';
+            renderMatrix();
+        }
+
+        function renderMatrix() {
+            const container = document.getElementById('matrix-container');
+            if (!container) return;
+
+            if (cachedCameras.length === 0) {
+                container.innerHTML = '<p style="color: var(--text-muted); padding: 2rem;">No cameras online.</p>';
+                return;
+            }
+
+            // Check if existing elements already match cached cameras to prevent stream flickering
+            const existingCards = container.querySelectorAll('.matrix-card');
+            if (existingCards.length === cachedCameras.length) {
+                // Update text/badges in-place
+                cachedCameras.forEach(cam => {
+                    const statusDot = document.getElementById(`cam-dot-${cam.id}`);
+                    const detText = document.getElementById(`cam-det-${cam.id}`);
+                    const resBadge = document.getElementById(`cam-res-${cam.id}`);
+                    if (statusDot) {
+                        statusDot.style.backgroundColor = cam.is_active ? 'var(--status-green)' : '#fca5a5';
+                    }
+                    if (resBadge) {
+                        resBadge.innerText = cam.resolution;
+                    }
+                    if (detText) {
+                        if (!cam.is_active) {
+                            detText.innerHTML = '<span style="color: #fca5a5;">⏸️ Capture Paused</span>';
+                        } else if (cam.detections && cam.detections.length > 0) {
+                            const items = cam.detections.map(d => `${d.label} (${Math.round(d.confidence*100)}%)`).join(', ');
+                            detText.innerHTML = `🎯 <strong style="color: var(--alert-orange);">${items}</strong>`;
+                        } else {
+                            detText.innerHTML = '<span style="color: var(--status-green);">🟢 Scene Clear</span>';
+                        }
+                    }
+                });
+                return;
+            }
+
+            // Full render of cards
+            container.innerHTML = cachedCameras.map(cam => {
+                const streamUrl = `/api/cameras/${cam.id}/stream?res=720p`;
+                const topItems = (cam.detections && cam.detections.length > 0)
+                    ? cam.detections.map(d => `${d.label} (${Math.round(d.confidence*100)}%)`).join(', ')
+                    : '🟢 Scene Clear';
+
+                return `
+                    <div class="matrix-card" id="matrix-card-${cam.id}">
+                        <div class="matrix-card-header">
+                            <div style="display: flex; align-items: center; gap: 0.5rem;">
+                                <div id="cam-dot-${cam.id}" style="width: 8px; height: 8px; border-radius: 50%; background: ${cam.is_active ? 'var(--status-green)' : '#fca5a5'};"></div>
+                                <strong style="font-size: 0.9rem; color: var(--text-primary);">${cam.name}</strong>
+                                <span class="badge" style="font-size: 0.72rem; padding: 0.15rem 0.4rem;">${cam.cam_type.toUpperCase()}</span>
+                            </div>
+                            <span class="badge" id="cam-res-${cam.id}" style="font-size: 0.72rem;">${cam.resolution}</span>
+                        </div>
+
+                        <div class="matrix-feed-box" onclick="focusCamera(${cam.id})" title="Click to Maximize">
+                            <img class="matrix-feed" src="${streamUrl}" alt="${cam.name}" loading="lazy" />
+                            <div class="matrix-click-hint">🔍 Click to Maximize</div>
+                        </div>
+
+                        <div class="matrix-card-footer">
+                            <div id="cam-det-${cam.id}" style="font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%;">
+                                ${cam.is_active ? topItems : '<span style="color: #fca5a5;">⏸️ Paused</span>'}
+                            </div>
+                            <div style="display: flex; gap: 0.4rem; align-items: center;">
+                                <button class="btn btn-sm" onclick="focusCamera(${cam.id})" style="padding: 0.25rem 0.6rem; font-size: 0.78rem;">
+                                    🔍 Focus
+                                </button>
+                                ${cam.id !== 1 ? `
+                                    <button class="btn btn-sm" onclick="deleteCamera(${cam.id}, '${cam.name}')" style="background: rgba(255, 68, 68, 0.12); border-color: #ff4444; color: #ff6b6b; padding: 0.25rem 0.5rem;" title="Remove Camera">
+                                        🗑️
+                                    </button>
+                                ` : ''}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        async function refreshCamerasList() {
+            try {
+                const res = await fetch('/api/cameras');
+                cachedCameras = await res.json();
+                syncCameraSelector();
+                if (currentViewMode === 'matrix') {
+                    renderMatrix();
+                }
+            } catch(e) {}
+        }
+
+        function syncCameraSelector() {
+            const sel = document.getElementById('camera-select');
+            if (!sel) return;
+
+            let html = '<option value="matrix">🔲 All Cameras (Matrix Grid)</option>';
+            cachedCameras.forEach(c => {
+                html += `<option value="${c.id}">📹 ${c.name} (${c.cam_type.toUpperCase()})</option>`;
+            });
+            sel.innerHTML = html;
+
+            if (currentViewMode === 'single' && cachedCameras.some(c => c.id === activeCameraId)) {
+                sel.value = String(activeCameraId);
+            } else if (currentViewMode === 'matrix') {
+                sel.value = 'matrix';
+            }
+        }
 
         async function updateStats() {
             try {
@@ -809,18 +1300,8 @@ HTML_TEMPLATE = """
                 if (data.version) {
                     document.getElementById('version-badge').innerText = 'v' + data.version;
                 }
-                if (data.resolution && document.getElementById('hud-res')) {
-                    if (data.is_capture_active === false) {
-                        document.getElementById('hud-res').innerText = 'FEED: PAUSED (Standby Mode)';
-                    } else {
-                        document.getElementById('hud-res').innerText = 'FEED: ' + data.resolution + ' @ ' + (data.fps || 30) + ' FPS';
-                    }
-                }
                 if (data.cpu_temp) {
                     document.getElementById('temp-badge').innerText = 'CPU: ' + data.cpu_temp;
-                }
-                if (data.inference_ms !== undefined) {
-                    document.getElementById('latency-badge').innerText = '⚡ ML: ' + data.inference_ms + ' ms';
                 }
                 if (data.storage && data.storage.free_percent !== undefined) {
                     document.getElementById('storage-badge').innerText = '💾 Disk: ' + data.storage.free_percent + '% Free';
@@ -829,53 +1310,82 @@ HTML_TEMPLATE = """
                     document.getElementById('dvr-toggle').checked = data.continuous_recording;
                 }
 
-                // Capture Active State Handler
-                if (data.is_capture_active !== undefined) {
-                    isCaptureActive = data.is_capture_active;
-                    const btn = document.getElementById('btn-toggle-capture');
-                    const icon = document.getElementById('capture-icon');
-                    const text = document.getElementById('capture-text');
-                    const badge = document.getElementById('capture-badge');
-                    
-                    if (isCaptureActive) {
-                        if (btn) {
-                            btn.style.background = 'rgba(239, 68, 68, 0.15)';
-                            btn.style.borderColor = 'rgba(239, 68, 68, 0.4)';
-                            btn.style.color = '#fca5a5';
-                        }
-                        if (icon) icon.innerText = '⏸️';
-                        if (text) text.innerText = 'Stop Capture';
-                        if (badge) {
-                            badge.innerText = '📹 Capture: Active';
-                            badge.style.color = 'var(--status-green)';
-                            badge.style.borderColor = 'var(--border-color)';
-                        }
-                    } else {
-                        if (btn) {
-                            btn.style.background = 'rgba(16, 185, 129, 0.2)';
-                            btn.style.borderColor = 'rgba(16, 185, 129, 0.5)';
-                            btn.style.color = '#6ee7b7';
-                        }
-                        if (icon) icon.innerText = '▶️';
-                        if (text) text.innerText = 'Start Capture';
-                        if (badge) {
-                            badge.innerText = '⏸️ Capture: Paused';
-                            badge.style.color = '#fca5a5';
-                            badge.style.borderColor = 'rgba(239, 68, 68, 0.4)';
-                        }
+                // Sync camera list
+                if (data.cameras) {
+                    const prevCount = cachedCameras.length;
+                    cachedCameras = data.cameras;
+                    if (prevCount !== cachedCameras.length) {
+                        syncCameraSelector();
+                    }
+                    if (currentViewMode === 'matrix') {
+                        renderMatrix();
                     }
                 }
 
-                // Live Detections
+                // Get telemetry for the currently viewed camera (or primary)
+                const currentCam = cachedCameras.find(c => c.id === activeCameraId) || cachedCameras[0] || {};
+                const camActive = (currentCam.is_active !== undefined) ? currentCam.is_active : data.is_capture_active;
+                const camDets = currentCam.detections || data.detections || [];
+                const camRes = currentCam.resolution || data.resolution || 'offline';
+                const camFps = currentCam.fps || data.fps || 0;
+                const camInf = (currentCam.inference_ms !== undefined) ? currentCam.inference_ms : (data.inference_ms || 0.0);
+
+                if (document.getElementById('hud-res')) {
+                    if (!camActive) {
+                        document.getElementById('hud-res').innerText = 'FEED: PAUSED (Standby Mode)';
+                    } else {
+                        document.getElementById('hud-res').innerText = 'FEED: ' + camRes + ' @ ' + camFps + ' FPS';
+                    }
+                }
+                if (document.getElementById('latency-badge')) {
+                    document.getElementById('latency-badge').innerText = '⚡ ML: ' + camInf + ' ms';
+                }
+
+                // Header Capture Badge & Toggle Button
+                isCaptureActive = camActive;
+                const btn = document.getElementById('btn-toggle-capture');
+                const icon = document.getElementById('capture-icon');
+                const text = document.getElementById('capture-text');
+                const badge = document.getElementById('capture-badge');
+                
+                if (isCaptureActive) {
+                    if (btn) {
+                        btn.style.background = 'rgba(239, 68, 68, 0.15)';
+                        btn.style.borderColor = 'rgba(239, 68, 68, 0.4)';
+                        btn.style.color = '#fca5a5';
+                    }
+                    if (icon) icon.innerText = '⏸️';
+                    if (text) text.innerText = 'Stop Capture';
+                    if (badge) {
+                        badge.innerText = '📹 Capture: Active';
+                        badge.style.color = 'var(--status-green)';
+                        badge.style.borderColor = 'var(--border-color)';
+                    }
+                } else {
+                    if (btn) {
+                        btn.style.background = 'rgba(16, 185, 129, 0.2)';
+                        btn.style.borderColor = 'rgba(16, 185, 129, 0.5)';
+                        btn.style.color = '#6ee7b7';
+                    }
+                    if (icon) icon.innerText = '▶️';
+                    if (text) text.innerText = 'Start Capture';
+                    if (badge) {
+                        badge.innerText = '⏸️ Capture: Paused';
+                        badge.style.color = '#fca5a5';
+                        badge.style.borderColor = 'rgba(239, 68, 68, 0.4)';
+                    }
+                }
+
+                // Detections Banner
                 const detBadge = document.getElementById('detection-badge');
                 const bannerText = document.getElementById('banner-text');
 
                 if (!isCaptureActive) {
                     detBadge.innerText = '⏸️ Scanner Idle';
                     detBadge.classList.remove('detected');
-                    bannerText.innerHTML = '<span style="color: #fca5a5;">⏸️ Live Camera Ingestion Paused</span>';
-                } else if (data.detections && data.detections.length > 0) {
-                    const topItems = data.detections.map(d => `${d.label} (${Math.round(d.confidence * 100)}%)`).join(', ');
+                    bannerText.innerHTML = '<span style="color: #fca5a5;">⏸️ Camera Ingestion Paused</span>';
+                } else if (camDets && camDets.length > 0) {
+                    const topItems = camDets.map(d => `${d.label} (${Math.round(d.confidence * 100)}%)`).join(', ');
                     detBadge.innerText = '🎯 Detected: ' + topItems;
                     detBadge.classList.add('detected');
                     bannerText.innerHTML = '🎯 <strong style="color: var(--alert-orange);">' + topItems + '</strong> in frame';
@@ -894,7 +1404,11 @@ HTML_TEMPLATE = """
             const targetState = !isCaptureActive;
             if (btn) btn.disabled = true;
             try {
-                const res = await fetch('/api/settings/capture', {
+                const endpoint = (currentViewMode === 'single' && activeCameraId) 
+                    ? `/api/cameras/${activeCameraId}/capture` 
+                    : '/api/settings/capture';
+
+                const res = await fetch(endpoint, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ enabled: targetState })
@@ -902,9 +1416,9 @@ HTML_TEMPLATE = """
                 const data = await res.json();
                 if (data.status === 'ok') {
                     isCaptureActive = data.is_capture_active;
-                    const feed = document.querySelector('.video-feed');
-                    if (feed) {
-                        feed.src = '/api/stream?res=' + currentResolution + '&t=' + Date.now();
+                    const feed = document.getElementById('single-video-feed');
+                    if (feed && currentViewMode === 'single') {
+                        feed.src = `/api/cameras/${activeCameraId}/stream?res=${currentResolution}&t=${Date.now()}`;
                     }
                     updateStats();
                 }
@@ -1116,16 +1630,15 @@ HTML_TEMPLATE = """
             }
         }
 
-        let currentResolution = '1080p';
         function setResolution(res) {
             currentResolution = res;
             document.querySelectorAll('.res-btn').forEach(b => b.classList.remove('active'));
             const btn = document.getElementById('btn-res-' + res);
             if (btn) btn.classList.add('active');
             
-            const feed = document.querySelector('.video-feed');
+            const feed = document.getElementById('single-video-feed');
             if (feed) {
-                feed.src = '/api/stream?res=' + res + '&t=' + Date.now();
+                feed.src = `/api/cameras/${activeCameraId}/stream?res=${res}&t=${Date.now()}`;
             }
         }
 
