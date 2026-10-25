@@ -100,6 +100,12 @@ class CameraManager:
         cam.set_capture_active(active)
         return True
 
+    def set_all_capture(self, active: bool):
+        """Starts or pauses live capture on all cameras simultaneously."""
+        with self.lock:
+            for cam in self.cameras.values():
+                cam.set_capture_active(active)
+
     def get_all_status(self) -> List[Dict[str, Any]]:
         """Returns real-time status, FPS, resolution, and detections for all configured cameras."""
         db_cams = get_db_cameras()

@@ -176,13 +176,20 @@ class VideoCamera:
 
         while not self.stopped:
             if not self.is_capture_active:
-                # Flush underlying device buffer slowly without burning CPU
-                try:
-                    self.cap.grab()
-                except Exception:
-                    pass
-                time.sleep(0.08)
+                if self.cam_type == "local" and self.cap is not None:
+                    try:
+                        self.cap.grab()
+                    except Exception:
+                        pass
+                time.sleep(0.15)
                 continue
+
+            if self.cam_type == "rtsp" and (self.cap is None or not self.cap.isOpened()):
+                try:
+                    self.cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+                except Exception:
+                    time.sleep(1.0)
+                    continue
 
             try:
                 grabbed, frame = self.cap.read()
@@ -290,11 +297,18 @@ class VideoCamera:
         """Starts or pauses live camera capture, streaming, and ML inference."""
         with self.frame_lock:
             self.is_capture_active = active
+            if not active and self.cam_type == "rtsp" and self.cap is not None:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
+                self.grabbed = False
         with self.ml_lock:
             if not active:
                 self.latest_detections = []
                 self.inference_ms = 0.0
-        print(f"[CAMERA] Live capture state changed: is_capture_active={active}")
+        print(f"[CAMERA] Camera #{self.camera_id} ('{self.name}') state: is_capture_active={active}")
 
     def get_latest_detections(self) -> Tuple[List[dict], float]:
         """Returns current detections and inference latency in ms."""

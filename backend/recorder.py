@@ -43,8 +43,8 @@ class VideoRecorder:
         self.retention_hours = retention_hours
         self.min_free_percent = min_free_percent
 
-        # Rolling pre-roll buffer in RAM (60 frames at 30 FPS = 2 seconds)
-        buffer_len = int(fps * pre_roll_seconds)
+        # Rolling pre-roll buffer in RAM (capped at 30 frames to conserve memory across multiple 2K streams)
+        buffer_len = min(30, max(10, int(fps * pre_roll_seconds)))
         self.frame_buffer = collections.deque(maxlen=buffer_len)
         self.buffer_lock = threading.Lock()
 

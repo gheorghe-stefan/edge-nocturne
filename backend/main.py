@@ -314,13 +314,10 @@ def toggle_continuous_loop(req: ContinuousSettingRequest):
 
 @app.post("/api/settings/capture")
 def toggle_camera_capture(req: CaptureSettingRequest):
-    """Starts or stops live camera capture on primary camera."""
+    """Starts or stops live camera capture on all cameras simultaneously."""
     if not camera_manager:
         raise HTTPException(status_code=503, detail="Camera manager not ready")
-    cam = camera_manager.get_primary_camera()
-    if not cam:
-        raise HTTPException(status_code=503, detail="Camera not initialized")
-    cam.set_capture_active(req.enabled)
+    camera_manager.set_all_capture(req.enabled)
     return {"status": "ok", "is_capture_active": req.enabled}
 
 
