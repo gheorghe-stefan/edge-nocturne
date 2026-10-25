@@ -297,13 +297,6 @@ class VideoCamera:
         """Starts or pauses live camera capture, streaming, and ML inference."""
         with self.frame_lock:
             self.is_capture_active = active
-            if not active and self.cam_type == "rtsp" and self.cap is not None:
-                try:
-                    self.cap.release()
-                except Exception:
-                    pass
-                self.cap = None
-                self.grabbed = False
         with self.ml_lock:
             if not active:
                 self.latest_detections = []
