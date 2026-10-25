@@ -222,7 +222,12 @@ class VideoCamera:
             success, frame = self.get_latest_frame()
             if success and frame is not None:
                 try:
-                    detections, latency = self.detector.detect(frame)
+                    detections, latency = self.detector.detect(frame, wait=False)
+                    if detections is None:
+                        # Shared detector is busy with another camera; yield and retry next cycle
+                        time.sleep(0.25)
+                        continue
+
                     with self.ml_lock:
                         self.latest_detections = detections
                         self.inference_ms = latency

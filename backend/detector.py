@@ -107,18 +107,22 @@ class ObjectDetector:
                 return cat
         return "other"
 
-    def detect(self, bgr_frame: np.ndarray) -> Tuple[List[Dict[str, Any]], float]:
+    def detect(self, bgr_frame: np.ndarray, wait: bool = True) -> Tuple[Optional[List[Dict[str, Any]]], float]:
         """Runs inference and returns normalized detections [ymin, xmin, ymax, xmax] and latency ms."""
-        start_time = time.perf_counter()
+        acquired = self.lock.acquire(blocking=wait)
+        if not acquired:
+            return None, 0.0
 
-        with self.lock:
+        try:
+            start_time = time.perf_counter()
             if self.is_yolo:
                 detections = self._detect_yolo(bgr_frame)
             else:
                 detections = self._detect_litert(bgr_frame)
-
-        latency_ms = round((time.perf_counter() - start_time) * 1000.0, 1)
-        return detections, latency_ms
+            latency_ms = round((time.perf_counter() - start_time) * 1000.0, 1)
+            return detections, latency_ms
+        finally:
+            self.lock.release()
 
     def _detect_yolo(self, bgr_frame: np.ndarray) -> List[Dict[str, Any]]:
         orig_h, orig_w = bgr_frame.shape[:2]
