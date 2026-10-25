@@ -1266,7 +1266,7 @@ HTML_TEMPLATE = """
                     }
                     if (detText) {
                         if (!cam.is_active) {
-                            detText.innerHTML = '<span style="color: #fca5a5;">⏸️ Stopped</span>';
+                            detText.innerHTML = '<span style="color: var(--text-muted); font-size: 0.75rem;">(Stream Stopped)</span>';
                         } else if (cam.detections && cam.detections.length > 0) {
                             const items = cam.detections.map(d => `${d.label} (${Math.round(d.confidence*100)}%)`).join(', ');
                             detText.innerHTML = `🎯 <strong style="color: var(--alert-orange);">${items}</strong>`;
@@ -1309,19 +1309,21 @@ HTML_TEMPLATE = """
                             <span class="badge" id="cam-res-${cam.id}" style="font-size: 0.72rem;">${cam.resolution}</span>
                         </div>
 
-                        <div class="matrix-feed-box" onclick="focusCamera(${cam.id})" title="Click to Maximize">
+                        <div class="matrix-feed-box" onclick="focusCamera(${cam.id})">
                             <img class="matrix-feed" id="matrix-img-${cam.id}" src="${streamUrl}" alt="${cam.name}" onerror="onMatrixFeedError(${cam.id})" />
                             <div class="matrix-click-hint">🔍 Click to Maximize</div>
                         </div>
 
                         <div class="matrix-card-footer">
-                            <div id="cam-det-${cam.id}" style="font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 45%;">
-                                ${cam.is_active ? topItems : '<span style="color: #fca5a5;">⏸️ Stopped</span>'}
-                            </div>
                             <div style="display: flex; gap: 0.35rem; align-items: center;">
-                                <button class="btn btn-sm" id="btn-pause-${cam.id}" onclick="event.stopPropagation(); toggleSpecificCameraCapture(${cam.id})" style="${cam.is_active ? 'background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.4); color: #fca5a5;' : 'background: rgba(16, 185, 129, 0.2); border-color: rgba(16, 185, 129, 0.5); color: #6ee7b7;'} padding: 0.25rem 0.55rem; font-size: 0.78rem;" title="${cam.is_active ? 'Stop / Pause Camera Stream' : 'Start / Resume Camera Stream'}">
+                                <button class="btn btn-sm" id="btn-pause-${cam.id}" onclick="event.stopPropagation(); toggleSpecificCameraCapture(${cam.id})" style="${cam.is_active ? 'background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.4); color: #fca5a5;' : 'background: rgba(16, 185, 129, 0.2); border-color: rgba(16, 185, 129, 0.5); color: #6ee7b7;'} padding: 0.25rem 0.6rem; font-size: 0.78rem; font-weight: 600;">
                                     ${cam.is_active ? '⏸️ Stop' : '▶️ Start'}
                                 </button>
+                            </div>
+                            <div id="cam-det-${cam.id}" style="font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 0 0.4rem; flex: 1; text-align: center;">
+                                ${cam.is_active ? topItems : '<span style="color: var(--text-muted); font-size: 0.75rem;">(Stream Stopped)</span>'}
+                            </div>
+                            <div style="display: flex; gap: 0.35rem; align-items: center;">
                                 <button class="btn btn-sm" onclick="event.stopPropagation(); focusCamera(${cam.id})" style="padding: 0.25rem 0.55rem; font-size: 0.78rem;">
                                     🔍 Focus
                                 </button>
@@ -1341,7 +1343,10 @@ HTML_TEMPLATE = """
             const cam = cachedCameras.find(c => c.id === camId);
             const targetState = cam ? !cam.is_active : false;
             const btn = document.getElementById(`btn-pause-${camId}`);
-            if (btn) btn.disabled = true;
+            if (btn) {
+                btn.disabled = true;
+                btn.innerText = targetState ? 'Starting...' : 'Stopping...';
+            }
 
             try {
                 const res = await fetch(`/api/cameras/${camId}/capture`, {
@@ -1352,11 +1357,22 @@ HTML_TEMPLATE = """
                 const data = await res.json();
                 if (data.status === 'ok') {
                     if (cam) cam.is_active = data.is_capture_active;
-                    const img = document.getElementById(`matrix-img-${camId}`);
-                    if (img) {
-                        if (matrixStreamMode === 'live') {
-                            img.src = `/api/cameras/${camId}/stream?res=480p&t=${Date.now()}`;
+                    if (btn) {
+                        if (data.is_capture_active) {
+                            btn.innerHTML = '⏸️ Stop';
+                            btn.style.background = 'rgba(239, 68, 68, 0.15)';
+                            btn.style.borderColor = 'rgba(239, 68, 68, 0.4)';
+                            btn.style.color = '#fca5a5';
                         } else {
+                            btn.innerHTML = '▶️ Start';
+                            btn.style.background = 'rgba(16, 185, 129, 0.2)';
+                            btn.style.borderColor = 'rgba(16, 185, 129, 0.5)';
+                            btn.style.color = '#6ee7b7';
+                        }
+                    }
+                    if (matrixStreamMode === 'eco') {
+                        const img = document.getElementById(`matrix-img-${camId}`);
+                        if (img) {
                             img.src = `/api/cameras/${camId}/snapshot?res=480p&t=${Date.now()}`;
                         }
                     }
